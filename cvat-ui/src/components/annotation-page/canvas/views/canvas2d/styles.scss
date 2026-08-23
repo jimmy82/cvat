@@ -61,3 +61,21 @@
         }
     }
 }
+
+.cvat-geo-coordinates-status-bar {
+    // `fixed`, not `absolute`: the canvas content this sits inside can be much taller
+    // than the viewport (a large raster, zoomed in), so an `absolute` `bottom` anchor
+    // would sit below the visible area rather than at the visible bottom of the screen.
+    position: fixed;
+    bottom: $grid-unit-size * 2;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 60%);
+    color: white;
+    padding: $grid-unit-size $grid-unit-size * 2;
+    border-radius: $border-radius-base;
+    font-size: smaller;
+    font-family: monospace;
+    z-index: 100;
+    pointer-events: none;
+}

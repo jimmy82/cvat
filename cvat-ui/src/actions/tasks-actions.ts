@@ -293,6 +293,16 @@ ThunkAction {
             extras.consensus_replicas = description.consensus_replicas;
         }
 
+        // GeoTIFF tiling options: only meaningful for a georeferenced-raster upload,
+        // silently ignored by the backend for any other media type, so there's no need
+        // to conditionally hide these based on what's being uploaded.
+        if (data.advanced.tileSize) {
+            extras.tile_size = +data.advanced.tileSize;
+        }
+        if (typeof data.advanced.tileOverlap !== 'undefined' && data.advanced.tileOverlap !== '') {
+            extras.overlap = +data.advanced.tileOverlap;
+        }
+
         const taskInstance = new cvat.classes.Task(description);
         try {
             const savedTask = await taskInstance.save(extras, {

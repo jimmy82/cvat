@@ -855,6 +855,9 @@ export function implementTask(Task: typeof TaskClass): typeof TaskClass {
                 ...(typeof this.copyData !== 'undefined' ? { copy_data: this.copyData } : {}),
                 ...(typeof this.cloudStorageId !== 'undefined' ? { cloud_storage_id: this.cloudStorageId } : {}),
                 ...(fields?.validation_params ? { validation_params: fields.validation_params } : {}),
+                ...(typeof fields?.tile_size !== 'undefined' ? { tile_size: fields.tile_size } : {}),
+                ...(typeof fields?.overlap !== 'undefined' ? { overlap: fields.overlap } : {}),
+                ...(typeof fields?.reencode_as_cog !== 'undefined' ? { reencode_as_cog: fields.reencode_as_cog } : {}),
             };
 
             const { taskID, rqID } = await serverProxy.tasks.create(

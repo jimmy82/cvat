@@ -48,6 +48,9 @@ psycopg2-binary~=2.9
 python-ldap==3.4.7
 python-logstash-async==4.1.0
 python-rapidjson>=1.20
+# DSO-SR-SEP: GeoTIFF ingestion/tiling (cvat.apps.geospatial). The manylinux wheel
+# bundles its own GDAL build, so no extra system packages are needed to install it.
+rasterio~=1.4
 redis~=8.1
 requests~=2.34
 rq-scheduler==0.13.1

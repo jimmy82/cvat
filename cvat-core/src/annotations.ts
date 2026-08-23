@@ -246,7 +246,7 @@ export function importDataset(
         throw new ArgumentError('Option "importMode" must be "replace" or "append"');
     }
     const allowedFileExtensions = [
-        '.zip', '.xml', '.json', '.tsv',
+        '.zip', '.xml', '.json', '.tsv', '.geojson',
     ];
     const allowedFileExtensionsList = allowedFileExtensions.join(', ');
     if (typeof file === 'string' && !(allowedFileExtensions.some((ext) => file.toLowerCase().endsWith(ext)))) {
@@ -259,6 +259,9 @@ export function importDataset(
         'application/zip', 'application/x-zip-compressed',
         'application/xml', 'text/xml',
         'application/json', 'text/tab-separated-values',
+        // Browsers report a plain .geojson file's MIME type as this registered
+        // GeoJSON-specific type, not 'application/json'.
+        'application/geo+json',
     ];
     if (file instanceof File && !(allowedMimeTypes.includes(file.type))) {
         throw new ArgumentError(

@@ -154,3 +154,7 @@ import cvat.apps.dataset_manager.formats.velodynepoint
 import cvat.apps.dataset_manager.formats.vggface2
 import cvat.apps.dataset_manager.formats.widerface
 import cvat.apps.dataset_manager.formats.yolo
+
+# DSO-SR-SEP: registers the "GeoJSON" export/import format for GeoTIFF-backed tasks
+# (see cvat/apps/geospatial/README.md and cvat/apps/geospatial/dataset_io.py).
+import cvat.apps.geospatial.dataset_io

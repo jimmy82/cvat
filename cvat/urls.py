@@ -58,3 +58,9 @@ if apps.is_installed("cvat.apps.access_tokens"):
 
 if apps.is_installed("cvat.apps.growth"):
     urlpatterns.append(path("api/", include("cvat.apps.growth.urls")))
+
+if apps.is_installed("cvat.apps.ml_processing"):
+    urlpatterns.append(path("api/", include("cvat.apps.ml_processing.urls")))
+
+if apps.is_installed("cvat.apps.geospatial"):
+    urlpatterns.append(path("api/", include("cvat.apps.geospatial.urls")))

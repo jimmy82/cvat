@@ -48,6 +48,9 @@ from cvat.apps.engine.media_extractors import (
 from cvat.apps.engine.media_io.audio_provider import TaskAudioProvider
 from cvat.apps.engine.media_io.frame_provider import TaskFrameProvider
 from cvat.apps.engine.rq import ImportRQMeta
+from cvat.apps.geospatial.ingestion import DEFAULT_OVERLAP as DEFAULT_GEOTIFF_OVERLAP
+from cvat.apps.geospatial.ingestion import DEFAULT_TILE_SIZE as DEFAULT_GEOTIFF_TILE_SIZE
+from cvat.apps.geospatial.services import persist_raster_metadata
 from cvat.apps.engine.task_validation import HoneypotFrameSelector
 from cvat.apps.engine.utils import av_scan_paths, format_list, get_path_size, take_by
 from cvat.utils import django_database as db_utils
@@ -252,7 +255,7 @@ def _create_segments_and_jobs(
     db_task.save()
 
 
-def _count_files(data: dict[str, Any]) -> dict[str, list[str]]:
+def _count_files(data: dict[str, Any], *, upload_dir: str | None = None) -> dict[str, list[str]]:
     share_root = settings.SHARE_ROOT
     server_files = [f.rstrip("/") for f in data["server_files"]]
 
@@ -287,7 +290,19 @@ def _count_files(data: dict[str, Any]) -> dict[str, list[str]]:
     counter = {media_type: [] for media_type in MEDIA_TYPES.keys()}
 
     count_files(
-        file_mapping={f: f for f in data["remote_files"] or data["client_files"]},
+        # DSO-SR-SEP: use the real on-disk path (once it's known, i.e. once the files
+        # have actually been saved to `upload_dir`) rather than the bare filename, so
+        # `has_mime_type` checks that need to open the file -- e.g. `geospatial`'s
+        # `_is_geotiff`, which has to actually read the raster to tell a georeferenced
+        # TIFF from a plain one -- aren't silently checking a nonexistent relative path
+        # (resolved against the worker process's arbitrary cwd) and falling through to
+        # a less specific media type. Every existing `has_mime_type` check only looks at
+        # the extension via `mimetypes.guess_type`, which doesn't care whether the path
+        # is absolute or exists, so this is a no-op for all of them.
+        file_mapping={
+            f: os.path.join(upload_dir, f) if upload_dir else f
+            for f in data["remote_files"] or data["client_files"]
+        },
         counter=counter,
     )
 
@@ -1668,7 +1683,7 @@ def initialize_task(
         )
 
     # count and validate uploaded files
-    media = _count_files(data)
+    media = _count_files(data, upload_dir=upload_dir)
     media, detected_mode = _validate_data(media, manifest_files=manifest_files)
     is_media_sorted = False
 
@@ -1833,7 +1848,37 @@ def initialize_task(
         if media_type != "audio":
             details["step"] = db_data.get_frame_step()
 
+        if media_type == "geotiff":
+            # DSO-SR-SEP geospatial integration: these are accepted via `data` today
+            # (falling back to GeoTiffTileReader's own defaults if absent) rather than
+            # being first-class DataSerializer fields yet -- see
+            # cvat/apps/geospatial/README.md ("Known integration gaps") for the small,
+            # separate serializer change that would expose them as a real API surface.
+            # `or` would silently discard an explicitly-requested falsy `overlap=0`
+            # (a perfectly valid "no overlap between tiles" request) and fall back to
+            # the default instead -- dict.get's own default argument doesn't have that
+            # problem, since it only kicks in when the key is genuinely absent.
+            details["tile_size"] = data.get("tile_size", DEFAULT_GEOTIFF_TILE_SIZE)
+            details["overlap"] = data.get("overlap", DEFAULT_GEOTIFF_OVERLAP)
+            details["reencode_as_cog"] = data.get("reencode_as_cog", True)
+
         extractor = MEDIA_TYPES[media_type]["extractor"](**details)
+
+        if media_type == "geotiff":
+            # Persist the tile grid the extractor just computed against this Task, so
+            # cvat.apps.ml_processing can later map a job's frames back to pixel
+            # windows/geotransform when talking to the external processing engine, and
+            # so annotation coordinates can be converted back to the source raster's
+            # CRS on export. Reuses the extractor's own already-computed tile_specs
+            # rather than recomputing them, so the two can never drift apart.
+            persist_raster_metadata(
+                task=db_task,
+                raster_path=extractor.raster_path,
+                tile_specs=extractor.tile_specs,
+                tile_size=extractor.tile_size,
+                overlap=extractor.overlap,
+                was_reencoded_as_cog=extractor.was_reencoded_as_cog,
+            )
 
     if extractor is None:
         raise ValidationError("Can't create a task without data")

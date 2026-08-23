@@ -1407,6 +1407,9 @@ class TaskViewSet(
                     "job_file_mapping",
                     "server_files_exclude",
                     "validation_params",
+                    "tile_size",
+                    "overlap",
+                    "reencode_as_cog",
                 ]:
                     if optional_field in serializer.validated_data:
                         data[optional_field] = serializer.validated_data[optional_field]

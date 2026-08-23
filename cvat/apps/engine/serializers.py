@@ -2662,6 +2662,37 @@ class DataSerializer(serializers.ModelSerializer):
     )
     job_file_mapping = JobFileMapping(required=False, write_only=True)
 
+    tile_size = serializers.IntegerField(
+        min_value=1,
+        required=False,
+        write_only=True,
+        help_text=textwrap.dedent("""\
+            Only used for GeoTIFF uploads: the width/height in pixels of each tile a
+            georeferenced raster is split into (one tile becomes one CVAT frame).
+            Set this larger than the raster's own width/height to get the whole raster
+            as a single frame instead of a tiled sequence. Defaults to 1024 if omitted.
+        """),
+    )
+    overlap = serializers.IntegerField(
+        min_value=0,
+        required=False,
+        write_only=True,
+        help_text=textwrap.dedent("""\
+            Only used for GeoTIFF uploads: how many pixels adjacent tiles overlap by,
+            so objects straddling a tile boundary aren't fully invisible to any single
+            annotator. Must be smaller than tile_size. Defaults to 64 if omitted.
+        """),
+    )
+    reencode_as_cog = serializers.BooleanField(
+        required=False,
+        write_only=True,
+        help_text=textwrap.dedent("""\
+            Only used for GeoTIFF uploads: whether to re-encode the raster as a tiled
+            Cloud-Optimized GeoTIFF before tiling, if it isn't already laid out that
+            way. Defaults to true if omitted.
+        """),
+    )
+
     upload_file_order = serializers.ListField(
         child=serializers.CharField(max_length=MAX_FILENAME_LENGTH),
         default=list,
@@ -2703,6 +2734,9 @@ class DataSerializer(serializers.ModelSerializer):
             "job_file_mapping",
             "upload_file_order",
             "validation_params",
+            "tile_size",
+            "overlap",
+            "reencode_as_cog",
         )
         extra_kwargs = {
             "chunk_size": {"help_text": "Maximum number of frames per chunk"},
@@ -2762,6 +2796,13 @@ class DataSerializer(serializers.ModelSerializer):
             and attrs["start_frame"] > attrs["stop_frame"]
         ):
             raise serializers.ValidationError("Stop frame must be more or equal start frame")
+
+        if (
+            "tile_size" in attrs
+            and "overlap" in attrs
+            and attrs["overlap"] >= attrs["tile_size"]
+        ):
+            raise serializers.ValidationError("overlap must be smaller than tile_size")
 
         filename_pattern = attrs.get("filename_pattern")
         server_files_exclude = attrs.get("server_files_exclude")

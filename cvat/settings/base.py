@@ -148,6 +148,11 @@ INSTALLED_APPS = [
     "cvat.apps.consensus",
     "cvat.apps.access_tokens",
     "cvat.apps.growth",
+    # DSO-SR-SEP: GeoTIFF ingestion/tiling + external Python processing engine
+    # integration (see cvat/apps/geospatial/README.md and
+    # cvat/apps/ml_processing/INTEGRATION.md).
+    "cvat.apps.geospatial",
+    "cvat.apps.ml_processing",
 ]
 
 AUTH_USER_MODEL = "iam.User"
@@ -337,6 +342,7 @@ class CVAT_QUEUES(Enum):
     CLEANING = "cleaning"
     CHUNKS = "chunks"
     CONSENSUS = "consensus"
+    ML_PROCESSING = "ml_processing"
 
 
 redis_inmem_host = os.getenv("CVAT_REDIS_INMEM_HOST", "localhost")
@@ -382,6 +388,14 @@ RQ_QUEUES = {
     CVAT_QUEUES.WEBHOOKS.value: {
         **REDIS_INMEM_SETTINGS,
         "DEFAULT_TIMEOUT": "25s",
+    },
+    CVAT_QUEUES.ML_PROCESSING.value: {
+        **REDIS_INMEM_SETTINGS,
+        # Covers the outbound POST to the external engine, not the engine's own
+        # processing time -- the engine reports back asynchronously via its signed
+        # callback (cvat.apps.ml_processing), so this only needs to bound how long
+        # CVAT waits on the initial hand-off request.
+        "DEFAULT_TIMEOUT": "5m",
     },
     CVAT_QUEUES.NOTIFICATIONS.value: {
         **REDIS_INMEM_SETTINGS,

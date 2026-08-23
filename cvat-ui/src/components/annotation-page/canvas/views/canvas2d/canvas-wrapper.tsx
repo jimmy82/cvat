@@ -405,9 +405,81 @@ function mapDispatchToProps(dispatch: any): DispatchToProps {
 
 type Props = StateToProps & DispatchToProps;
 
+interface GeospatialFrame {
+    frame: number;
+    width: number;
+    height: number;
+    corners: {
+        top_left: [number, number];
+        top_right: [number, number];
+        bottom_left: [number, number];
+        bottom_right: [number, number];
+    };
+}
+
 class CanvasWrapperComponent extends React.PureComponent<Props> {
     private debouncedUpdate = debounce(this.updateCanvas.bind(this), 250, { leading: true });
     private canvasTipsRef = React.createRef<CanvasTipsComponent>();
+    private geoStatusBarRef = React.createRef<HTMLDivElement>();
+    // Only used for a GeoTIFF-backed task (see cvat.apps.geospatial); null means either
+    // "not fetched yet" or "this task isn't geotiff-backed", both of which keep the
+    // status bar hidden -- see fetchGeospatialFrames.
+    private geospatialFrames: GeospatialFrame[] | null = null;
+
+    private fetchGeospatialFrames = async (): Promise<void> => {
+        const { jobInstance } = this.props;
+        try {
+            const response = await cvat.server.request(
+                `${cvat.config.backendAPI}/tasks/${jobInstance.taskId}/geospatial/frames/`,
+                { method: 'GET' },
+            );
+            this.geospatialFrames = response.data.frames;
+        } catch (error) {
+            // 404 for a task that isn't geotiff-backed, or that the geospatial app
+            // isn't installed at all -- either way, there's nothing to show.
+            this.geospatialFrames = null;
+        }
+    };
+
+    // Bilinear interpolation across the tile's 4 corner WGS84 coordinates -- an
+    // approximation (a real reprojection isn't exactly affine), but accurate enough for
+    // a live cursor readout over one tile; see TaskGeospatialFramesView's docstring.
+    private static interpolateGeoCoordinates(
+        geoFrame: GeospatialFrame, x: number, y: number,
+    ): [number, number] {
+        const tx = Math.min(1, Math.max(0, x / geoFrame.width));
+        const ty = Math.min(1, Math.max(0, y / geoFrame.height));
+        const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+        const {
+            top_left: topLeft, top_right: topRight, bottom_left: bottomLeft, bottom_right: bottomRight,
+        } = geoFrame.corners;
+        const topLon = lerp(topLeft[0], topRight[0], tx);
+        const topLat = lerp(topLeft[1], topRight[1], tx);
+        const bottomLon = lerp(bottomLeft[0], bottomRight[0], tx);
+        const bottomLat = lerp(bottomLeft[1], bottomRight[1], tx);
+        return [lerp(topLon, bottomLon, ty), lerp(topLat, bottomLat, ty)];
+    }
+
+    private updateGeoStatusBar(x: number, y: number): void {
+        const bar = this.geoStatusBarRef.current;
+        if (!bar) return;
+
+        if (!this.geospatialFrames) {
+            bar.style.display = 'none';
+            return;
+        }
+
+        const { frame } = this.props;
+        const geoFrame = this.geospatialFrames.find((entry) => entry.frame === frame);
+        if (!geoFrame || x < 0 || y < 0 || x > geoFrame.width || y > geoFrame.height) {
+            bar.style.display = 'none';
+            return;
+        }
+
+        const [lon, lat] = CanvasWrapperComponent.interpolateGeoCoordinates(geoFrame, x, y);
+        bar.style.display = 'block';
+        bar.textContent = `lon ${lon.toFixed(6)}, lat ${lat.toFixed(6)}`;
+    }
 
     public componentDidMount(): void {
         const {
@@ -462,6 +534,7 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
 
         this.initialSetup();
         this.updateCanvas();
+        this.fetchGeospatialFrames();
     }
 
     public componentDidUpdate(prevProps: Props): void {
@@ -883,6 +956,8 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
             jobInstance, activatedStateID, activatedElementID, workspace, onActivateObject,
         } = this.props;
 
+        this.updateGeoStatusBar(event.detail.x, event.detail.y);
+
         if (![Workspace.STANDARD, Workspace.REVIEW, Workspace.SINGLE_SHAPE].includes(workspace)) {
             return;
         }
@@ -1243,6 +1318,12 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
                         width: '100%',
                         height: '100%',
                     }}
+                />
+
+                <div
+                    ref={this.geoStatusBarRef}
+                    className='cvat-geo-coordinates-status-bar'
+                    style={{ display: 'none' }}
                 />
 
                 <Popover

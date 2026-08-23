@@ -52,6 +52,8 @@ export interface AdvancedConfiguration {
     consensusReplicas: number;
     sourceStorage: StorageData;
     targetStorage: StorageData;
+    tileSize?: number;
+    tileOverlap?: number;
 }
 
 export enum AdvancedConfigurationSection {
@@ -64,6 +66,7 @@ export enum AdvancedConfigurationSection {
     CONSENSUS = 'consensus',
     BUG_TRACKER = 'bugTracker',
     STORAGE = 'storage',
+    GEOTIFF_TILING = 'geotiffTiling',
 }
 
 export const CV_ADVANCED_CONFIGURATION_SECTIONS = [
@@ -76,6 +79,7 @@ export const CV_ADVANCED_CONFIGURATION_SECTIONS = [
     AdvancedConfigurationSection.CONSENSUS,
     AdvancedConfigurationSection.BUG_TRACKER,
     AdvancedConfigurationSection.STORAGE,
+    AdvancedConfigurationSection.GEOTIFF_TILING,
 ];
 
 export const AUDIO_ADVANCED_CONFIGURATION_SECTIONS = [
@@ -135,6 +139,21 @@ const validateOverlapSize: RuleRender = ({ getFieldValue }): RuleObject => ({
             if (typeof segmentSize !== 'undefined' && segmentSize !== '') {
                 if (+segmentSize <= +value) {
                     return Promise.reject(new Error('Segment size must be more than overlap size'));
+                }
+            }
+        }
+
+        return Promise.resolve();
+    },
+});
+
+const validateTileOverlap: RuleRender = ({ getFieldValue }): RuleObject => ({
+    validator(_: RuleObject, value?: string | number): Promise<void> {
+        if (typeof value !== 'undefined' && value !== '') {
+            const tileSize = getFieldValue('tileSize');
+            if (typeof tileSize !== 'undefined' && tileSize !== '') {
+                if (+tileSize <= +value) {
+                    return Promise.reject(new Error('Tile size must be more than tile overlap'));
                 }
             }
         }
@@ -352,6 +371,37 @@ class AdvancedConfigurationForm extends React.PureComponent<Props> {
         );
     }
 
+    private renderTileSize(): JSX.Element {
+        return (
+            <CVATTooltip title={'Only used for GeoTIFF uploads: splits a georeferenced raster into ' +
+                'square tiles of this size (in pixels), one tile per frame. Set this to (at least) the ' +
+                "raster's larger dimension to get the whole raster as a single frame instead. Defaults to 1024."}
+            >
+                <Form.Item label='Tile size' name='tileSize' rules={[{ validator: isInteger({ min: 1 }) }]}>
+                    <Input size='large' type='number' min={1} />
+                </Form.Item>
+            </CVATTooltip>
+        );
+    }
+
+    private renderTileOverlap(): JSX.Element {
+        return (
+            <CVATTooltip title={'Only used for GeoTIFF uploads: how many pixels adjacent tiles overlap ' +
+                'by, so objects straddling a tile boundary are not fully invisible to any single ' +
+                'annotator. Defaults to 64.'}
+            >
+                <Form.Item
+                    label='Tile overlap'
+                    name='tileOverlap'
+                    dependencies={['tileSize']}
+                    rules={[{ validator: isInteger({ min: 0 }) }, validateTileOverlap]}
+                >
+                    <Input size='large' type='number' min={0} />
+                </Form.Item>
+            </CVATTooltip>
+        );
+    }
+
     private renderBugTracker(): JSX.Element {
         return (
             <Form.Item
@@ -508,6 +558,7 @@ class AdvancedConfigurationForm extends React.PureComponent<Props> {
         const hasConsensus = this.hasSection(AdvancedConfigurationSection.CONSENSUS);
         const hasBugTracker = this.hasSection(AdvancedConfigurationSection.BUG_TRACKER);
         const hasStorage = this.hasSection(AdvancedConfigurationSection.STORAGE);
+        const hasGeotiffTiling = this.hasSection(AdvancedConfigurationSection.GEOTIFF_TILING);
 
         return (
             <Form initialValues={initialValues} ref={this.formRef} layout='vertical'>
@@ -573,6 +624,14 @@ class AdvancedConfigurationForm extends React.PureComponent<Props> {
                         </Col>
                         <Col span={11} offset={1}>
                             {this.renderTargetStorage()}
+                        </Col>
+                    </Row>
+                )}
+                {hasGeotiffTiling && (
+                    <Row justify='start'>
+                        <Col span={7}>{this.renderTileSize()}</Col>
+                        <Col span={7} offset={1}>
+                            {this.renderTileOverlap()}
                         </Col>
                     </Row>
                 )}
