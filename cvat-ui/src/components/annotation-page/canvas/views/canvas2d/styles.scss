@@ -79,3 +79,22 @@
     z-index: 100;
     pointer-events: none;
 }
+
+.cvat-geo-measure-toggle {
+    position: fixed;
+    bottom: $grid-unit-size * 2;
+    right: $grid-unit-size * 2;
+    background: rgba(0, 0, 0, 60%);
+    color: white;
+    padding: $grid-unit-size $grid-unit-size * 2;
+    border-radius: $border-radius-base;
+    font-size: smaller;
+    z-index: 100;
+    cursor: pointer;
+    user-select: none;
+
+    &.cvat-geo-measure-toggle-active {
+        background: #fa8c16;
+        color: black;
+    }
+}

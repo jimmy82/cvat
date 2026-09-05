@@ -405,6 +405,8 @@ function mapDispatchToProps(dispatch: any): DispatchToProps {
 
 type Props = StateToProps & DispatchToProps;
 
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
 interface GeospatialFrame {
     frame: number;
     width: number;
@@ -421,10 +423,30 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
     private debouncedUpdate = debounce(this.updateCanvas.bind(this), 250, { leading: true });
     private canvasTipsRef = React.createRef<CanvasTipsComponent>();
     private geoStatusBarRef = React.createRef<HTMLDivElement>();
+    private geoMeasureToggleRef = React.createRef<HTMLDivElement>();
     // Only used for a GeoTIFF-backed task (see cvat.apps.geospatial); null means either
     // "not fetched yet" or "this task isn't geotiff-backed", both of which keep the
     // status bar hidden -- see fetchGeospatialFrames.
     private geospatialFrames: GeospatialFrame[] | null = null;
+
+    // Ruler tool state. `rulerPointA` is the first of a pair of clicks, in image-pixel
+    // coordinates, tagged with the frame it was taken on (a measurement spanning two
+    // frames -- e.g. the user paged to a different tile mid-measurement -- isn't
+    // meaningful, so a frame change starts over rather than silently measuring across
+    // tiles). The line/text are raw SVG nodes appended directly into cvat-canvas's own
+    // `#cvat_canvas_content`/`#cvat_canvas_text_content` groups (see their `moveCanvas`/
+    // `transformCanvas` in cvat-canvas/src/typescript/canvasView.ts) so they pan/zoom
+    // exactly like a real annotation shape would, without needing any changes to the
+    // cvat-canvas package itself.
+    private measuring = false;
+    // `x`/`y`: public image-pixel space (canvas.moved's convention -- what geoFrame
+    // bounds and interpolateGeoCoordinates expect). `rawX`/`rawY`: content-local SVG
+    // space (what the line's own x1/y1/x2/y2 attributes need) -- see onMeasureCanvasClick.
+    private rulerPointA: {
+        x: number; y: number; rawX: number; rawY: number; frame: number;
+    } | null = null;
+    private rulerLineEl: SVGLineElement | null = null;
+    private rulerTextEl: SVGTextElement | null = null;
 
     private fetchGeospatialFrames = async (): Promise<void> => {
         const { jobInstance } = this.props;
@@ -434,12 +456,169 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
                 { method: 'GET' },
             );
             this.geospatialFrames = response.data.frames;
+            if (this.geoMeasureToggleRef.current) {
+                this.geoMeasureToggleRef.current.style.display = 'block';
+            }
         } catch (error) {
             // 404 for a task that isn't geotiff-backed, or that the geospatial app
             // isn't installed at all -- either way, there's nothing to show.
             this.geospatialFrames = null;
         }
     };
+
+    private toggleMeasureMode = (): void => {
+        this.measuring = !this.measuring;
+        this.rulerPointA = null;
+        if (!this.measuring) {
+            this.clearRuler();
+        }
+        this.forceUpdate();
+    };
+
+    private clearRuler(): void {
+        this.rulerLineEl?.remove();
+        this.rulerLineEl = null;
+        this.rulerTextEl?.remove();
+        this.rulerTextEl = null;
+    }
+
+    private static haversineDistanceMeters(
+        [lon1, lat1]: [number, number], [lon2, lat2]: [number, number],
+    ): number {
+        const EARTH_RADIUS_METERS = 6371000;
+        const toRad = (deg: number): number => (deg * Math.PI) / 180;
+        const dLat = toRad(lat2 - lat1);
+        const dLon = toRad(lon2 - lon1);
+        const a = (Math.sin(dLat / 2) ** 2) +
+            (Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * (Math.sin(dLon / 2) ** 2));
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return EARTH_RADIUS_METERS * c;
+    }
+
+    private static formatDistance(meters: number): string {
+        return meters >= 1000 ? `${(meters / 1000).toFixed(2)} km` : `${meters.toFixed(1)} m`;
+    }
+
+    // Mirrors cvat-canvas's own internal `translateToSVG` (shared.ts): maps a raw
+    // client-space point into `svg`'s own local coordinate system via its screen CTM.
+    // This is *content-local* space -- the same space real annotation shapes are drawn
+    // in (svg.js's own mouse handling resolves clicks straight into this space) -- which
+    // is NOT the same space `canvas.moved` reports (see below).
+    private static clientPointToLocalSVG(svg: SVGSVGElement, clientX: number, clientY: number): [number, number] {
+        const ctm = svg.getScreenCTM();
+        if (!ctm) return [clientX, clientY];
+        let point = svg.createSVGPoint();
+        point.x = clientX;
+        point.y = clientY;
+        point = point.matrixTransform(ctm.inverse());
+        return [point.x, point.y];
+    }
+
+    // Named distinctly from the pre-existing `onCanvasClicked` (a couple hundred lines
+    // down, unrelated -- it blurs focus on canvas click) since both are registered as
+    // plain native 'click' listeners on the same element; giving this one the same name
+    // would silently shadow one of the two class-field initializers.
+    private onMeasureCanvasClick = (event: MouseEvent): void => {
+        if (!this.measuring || !this.geospatialFrames) return;
+
+        const { canvasInstance } = this.props as { canvasInstance: Canvas };
+        const content = window.document.getElementById('cvat_canvas_content') as unknown as SVGSVGElement | null;
+        if (!content) return;
+
+        const [rawX, rawY] = CanvasWrapperComponent.clientPointToLocalSVG(content, event.clientX, event.clientY);
+        // `canvas.moved`'s listener (canvasView.ts) reports `translateToSVG(...) - offset`
+        // as its public image-pixel coordinate -- match that here too, since this is
+        // what geoFrame.width/height and interpolateGeoCoordinates are calibrated
+        // against (both ultimately come from the same `canvas.moved`-fed status bar).
+        const { offset } = canvasInstance.geometry;
+        const x = rawX - offset;
+        const y = rawY - offset;
+
+        const { frame } = this.props;
+        const geoFrame = this.geospatialFrames.find((entry) => entry.frame === frame);
+        if (!geoFrame || x < 0 || y < 0 || x > geoFrame.width || y > geoFrame.height) return;
+
+        if (!this.rulerPointA || this.rulerPointA.frame !== frame) {
+            this.rulerPointA = {
+                x, y, rawX, rawY, frame,
+            };
+            return;
+        }
+
+        const pointA = this.rulerPointA;
+        this.rulerPointA = null;
+        this.drawRuler(pointA, {
+            x, y, rawX, rawY, frame,
+        }, geoFrame);
+    };
+
+    private drawRuler(
+        pointA: { x: number; y: number; rawX: number; rawY: number },
+        pointB: { x: number; y: number; rawX: number; rawY: number },
+        geoFrame: GeospatialFrame,
+    ): void {
+        this.clearRuler();
+
+        const content = window.document.getElementById('cvat_canvas_content');
+        const textContent = window.document.getElementById(
+            'cvat_canvas_text_content',
+        ) as unknown as SVGSVGElement | null;
+        if (!content || !textContent) return;
+
+        // The line's endpoints are set in content-local space (rawX/rawY) -- the same
+        // space real annotation shapes are drawn in -- NOT the offset-adjusted "public"
+        // x/y (see onMeasureCanvasClick), which would place it off by `geometry.offset`.
+        const line = window.document.createElementNS(SVG_NS, 'line') as SVGLineElement;
+        line.setAttribute('x1', `${pointA.rawX}`);
+        line.setAttribute('y1', `${pointA.rawY}`);
+        line.setAttribute('x2', `${pointB.rawX}`);
+        line.setAttribute('y2', `${pointB.rawY}`);
+        line.setAttribute('stroke', '#fa8c16');
+        line.setAttribute('stroke-width', '2');
+        // Keeps the line visually the same thickness regardless of zoom, without
+        // needing to hook into cvat-canvas's own zoom-transform lifecycle.
+        line.setAttribute('vector-effect', 'non-scaling-stroke');
+        line.setAttribute('stroke-dasharray', '6,4');
+        content.appendChild(line);
+        this.rulerLineEl = line;
+
+        const distanceMeters = CanvasWrapperComponent.haversineDistanceMeters(
+            CanvasWrapperComponent.interpolateGeoCoordinates(geoFrame, pointA.x, pointA.y),
+            CanvasWrapperComponent.interpolateGeoCoordinates(geoFrame, pointB.x, pointB.y),
+        );
+
+        // `text_content` isn't zoom-scaled (see canvasView.ts's transformCanvas), so a
+        // point has to be converted from the (zoom-scaled) content coordinate system to
+        // the text layer's own local coordinate system via both elements' screen CTMs --
+        // the same technique cvat-canvas's own `displayShapeSize` uses for its live
+        // width/height label.
+        const contentEl = content as unknown as SVGSVGElement;
+        const contentCTM = contentEl.getScreenCTM();
+        const textCTM = textContent.getScreenCTM();
+        const midX = (pointA.rawX + pointB.rawX) / 2;
+        const midY = (pointA.rawY + pointB.rawY) / 2;
+        let labelX = midX;
+        let labelY = midY;
+        if (contentCTM && textCTM) {
+            let point = contentEl.createSVGPoint();
+            point.x = midX;
+            point.y = midY;
+            point = point.matrixTransform(contentCTM);
+            point = point.matrixTransform(textCTM.inverse());
+            labelX = point.x;
+            labelY = point.y;
+        }
+
+        const text = window.document.createElementNS(SVG_NS, 'text') as SVGTextElement;
+        text.setAttribute('x', `${labelX}`);
+        text.setAttribute('y', `${labelY - 8}`);
+        text.setAttribute('fill', '#fa8c16');
+        text.setAttribute('font-weight', 'bolder');
+        text.classList.add('cvat_canvas_text');
+        text.textContent = CanvasWrapperComponent.formatDistance(distanceMeters);
+        textContent.appendChild(text);
+        this.rulerTextEl = text;
+    }
 
     // Bilinear interpolation across the tile's 4 corner WGS84 coordinates -- an
     // approximation (a real reprojection isn't exactly affine), but accurate enough for
@@ -578,6 +757,13 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
             renderData,
         } = this.props;
         const { canvasInstance } = this.props as { canvasInstance: Canvas };
+
+        if (prevProps.frame !== this.props.frame) {
+            // A ruler measurement (and a pending first click waiting for its second)
+            // only makes sense within a single frame/tile -- see onCanvasClicked.
+            this.rulerPointA = null;
+            this.clearRuler();
+        }
 
         if (
             prevProps.showObjectsTextAlways !== showObjectsTextAlways ||
@@ -726,6 +912,7 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
         canvasInstance.html().removeEventListener('canvas.find', this.onCanvasFindObject);
         canvasInstance.html().removeEventListener('canvas.deactivated', this.onCanvasShapeDeactivated);
         canvasInstance.html().removeEventListener('canvas.moved', this.onCanvasCursorMoved);
+        canvasInstance.html().removeEventListener('click', this.onMeasureCanvasClick);
 
         canvasInstance.html().removeEventListener('canvas.zoom', this.onCanvasZoomChanged);
         canvasInstance.html().removeEventListener('canvas.fit', this.onCanvasImageFitted);
@@ -1207,6 +1394,7 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
         canvasInstance.html().addEventListener('canvas.find', this.onCanvasFindObject);
         canvasInstance.html().addEventListener('canvas.deactivated', this.onCanvasShapeDeactivated);
         canvasInstance.html().addEventListener('canvas.moved', this.onCanvasCursorMoved);
+        canvasInstance.html().addEventListener('click', this.onMeasureCanvasClick);
 
         canvasInstance.html().addEventListener('canvas.zoom', this.onCanvasZoomChanged);
         canvasInstance.html().addEventListener('canvas.fit', this.onCanvasImageFitted);
@@ -1325,6 +1513,19 @@ class CanvasWrapperComponent extends React.PureComponent<Props> {
                     className='cvat-geo-coordinates-status-bar'
                     style={{ display: 'none' }}
                 />
+
+                <div
+                    ref={this.geoMeasureToggleRef}
+                    className={
+                        this.measuring ?
+                            'cvat-geo-measure-toggle cvat-geo-measure-toggle-active' :
+                            'cvat-geo-measure-toggle'
+                    }
+                    style={{ display: 'none' }}
+                    onClick={this.toggleMeasureMode}
+                >
+                    {this.measuring ? 'Measuring (click 2 points)' : 'Measure distance'}
+                </div>
 
                 <Popover
                     destroyTooltipOnHide
