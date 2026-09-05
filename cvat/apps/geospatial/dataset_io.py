@@ -36,9 +36,9 @@ from rasterio.crs import CRS
 from rasterio.warp import transform as warp_transform
 from rest_framework.serializers import ValidationError
 
-from cvat.apps.dataset_manager.bindings import CommonData
+from cvat.apps.dataset_manager.bindings import CommonData, JobData
 from cvat.apps.dataset_manager.formats.registry import exporter, importer
-from cvat.apps.engine.models import ShapeType
+from cvat.apps.engine.models import Job, JobType, ShapeType, StateChoice
 from cvat.apps.geospatial.models import RasterTile
 from cvat.apps.geospatial.transforms import geo_to_tile_pixel, tile_pixel_to_geo
 
@@ -156,11 +156,38 @@ def build_feature_collection(instance_data: CommonData) -> dict:
     }
 
 
+def _require_jobs_completed(instance_data: CommonData) -> None:
+    """Refuse to export until the relevant job(s) are actually marked 'completed'.
+
+    Without this, a task-level export would silently merge in whatever partial
+    annotation work exists so far and call it a finished result -- the whole point of
+    tiling one raster across multiple jobs is that several annotators split the work,
+    so "export the task" should mean "everyone is done", not "here's whatever's there
+    right now". Ground-truth and consensus-replica jobs are excluded since they're not
+    part of the normal annotation workflow this check is guarding.
+    """
+    if isinstance(instance_data, JobData):
+        jobs = list(Job.objects.filter(pk=instance_data._db_job.id))
+    else:
+        jobs = list(
+            Job.objects.filter(segment__task=instance_data._db_task, type=JobType.ANNOTATION)
+        )
+
+    unfinished = [job for job in jobs if job.state != StateChoice.COMPLETED]
+    if unfinished:
+        job_ids = ", ".join(str(job.id) for job in unfinished)
+        raise ValidationError(
+            "GeoJSON export requires every annotation job to be marked 'completed' "
+            f"first (not yet completed: job id(s) {job_ids})."
+        )
+
+
 @exporter(name="GeoJSON", version="1.0", ext="GEOJSON")
 def _export(dst_file, temp_dir, instance_data: CommonData, save_images=False, **options):
     if save_images:
         raise ValidationError("Media export as a dataset is not supported for GeoJSON export")
 
+    _require_jobs_completed(instance_data)
     feature_collection = build_feature_collection(instance_data)
 
     file_writer = io.TextIOWrapper(dst_file, encoding="utf-8")
