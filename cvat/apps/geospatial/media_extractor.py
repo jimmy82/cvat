@@ -40,8 +40,10 @@ from cvat.apps.geospatial.ingestion import (
     ensure_cog,
     is_cog,
     is_georeferenced_raster,
+    needs_rpc_warp,
     pick_display_bands,
     read_tile_as_png_bytes,
+    warp_rpc_to_geotiff,
 )
 
 GEOTIFF_EXTENSIONS = (".tif", ".tiff")
@@ -107,12 +109,26 @@ class GeoTiffTileReader(ImageListReader):
         original_path = Path(source_paths[0])
         self.original_raster_path = original_path
         self.was_reencoded_as_cog = False
+        self.was_rpc_warped = False
         self.raster_path = original_path
 
-        if reencode_as_cog and not is_cog(original_path):
-            cog_path = original_path.with_suffix(".cog.tif")
-            self.raster_path = ensure_cog(original_path, cog_path)
-            self.was_reencoded_as_cog = self.raster_path != original_path
+        with rasterio.open(original_path) as probe:
+            if needs_rpc_warp(probe):
+                # RPC-referenced rasters (common for raw satellite/aerial imagery) have
+                # no direct affine transform to tile against -- warp once, up front,
+                # onto a real WGS84 grid, so every later step (tiling, COG re-encoding,
+                # coordinate transforms) sees an ordinary directly-georeferenced raster
+                # and needs no RPC-specific handling of its own. See
+                # cvat.apps.geospatial.ingestion.warp_rpc_to_geotiff.
+                warped_path = original_path.with_suffix(".rpc_warped.tif")
+                self.raster_path = warp_rpc_to_geotiff(original_path, warped_path)
+                self.was_rpc_warped = True
+
+        if reencode_as_cog and not is_cog(self.raster_path):
+            pre_cog_path = self.raster_path
+            cog_path = self.raster_path.with_suffix(".cog.tif")
+            self.raster_path = ensure_cog(self.raster_path, cog_path)
+            self.was_reencoded_as_cog = self.raster_path != pre_cog_path
 
         with rasterio.open(self.raster_path) as dataset:
             self.tile_specs: list[TileSpec] = build_tile_grid(
