@@ -7,11 +7,35 @@ from django.db import models
 from cvat.apps.engine.models import Task, TimestampedModel
 
 
+class GeoreferencingKind(models.TextChoices):
+    """How a `RasterSource` relates its pixel grid to real-world coordinates.
+
+    AFFINE covers both a raster's own direct affine transform and a GCP-fitted affine
+    (see `cvat.apps.geospatial.ingestion.resolve_georeferencing`) -- both are a single
+    linear `(col, row) -> (x, y)` mapping, so `RasterSource.affine`/`transform_*` apply
+    identically to either.
+
+    RPC covers rasters georeferenced via Rational Polynomial Coefficients (common for
+    raw satellite/aerial imagery) instead -- a pair of nonlinear rational polynomials,
+    not a single linear transform, so `transform_*` don't apply at all; `rpc_coefficients`
+    is used instead. Deliberately *not* pre-warped onto an affine grid at ingestion time
+    (unlike the earlier design this replaced): that would resample every pixel through an
+    approximation and change the raster's own dimensions, which is exactly what callers
+    of this georeferencing kind have asked not to happen. See
+    `cvat.apps.geospatial.rpc` for the forward/inverse math this implies for every
+    consumer (tiling stays untouched either way; only pixel<->geo conversion differs).
+    """
+
+    AFFINE = "affine"
+    RPC = "rpc"
+
+
 class RasterSource(TimestampedModel):
     """One row per GeoTIFF ingested into a Task. Keeps the raster's georeferencing and
     band information so tile-pixel annotations can later be converted back to
-    real-world coordinates (see `cvat.apps.geospatial.transforms`), and so the Python
-    processing engine can be told, per frame, which raster/window it came from.
+    real-world coordinates (see `cvat.apps.geospatial.transforms` for the AFFINE case,
+    `cvat.apps.geospatial.rpc` for the RPC case), and so the Python processing engine
+    can be told, per frame, which raster/window it came from.
     """
 
     task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="raster_sources")
@@ -20,15 +44,33 @@ class RasterSource(TimestampedModel):
     # other media paths -- keeps this model portable across storage backends.
     source_path = models.CharField(max_length=1024)
 
-    crs_wkt = models.TextField(help_text="Well-known text representation of the raster's CRS")
+    crs_wkt = models.TextField(
+        help_text=(
+            "Well-known text representation of the raster's CRS. Only meaningful "
+            "when georeferencing_kind == AFFINE -- RPC ground coordinates are always "
+            "WGS84 lon/lat by the RPC00B specification, independent of whatever "
+            "placeholder CRS the raster's own dataset-level tags might carry."
+        )
+    )
+
+    georeferencing_kind = models.CharField(
+        max_length=16, choices=GeoreferencingKind.choices, default=GeoreferencingKind.AFFINE
+    )
+
     # Affine geotransform coefficients (a, b, c, d, e, f), i.e. rasterio/GDAL order,
-    # such that (x, y) = (a*col + b*row + c, d*col + e*row + f).
-    transform_a = models.FloatField()
-    transform_b = models.FloatField()
-    transform_c = models.FloatField()
-    transform_d = models.FloatField()
-    transform_e = models.FloatField()
-    transform_f = models.FloatField()
+    # such that (x, y) = (a*col + b*row + c, d*col + e*row + f). Only set when
+    # georeferencing_kind == AFFINE.
+    transform_a = models.FloatField(null=True, blank=True)
+    transform_b = models.FloatField(null=True, blank=True)
+    transform_c = models.FloatField(null=True, blank=True)
+    transform_d = models.FloatField(null=True, blank=True)
+    transform_e = models.FloatField(null=True, blank=True)
+    transform_f = models.FloatField(null=True, blank=True)
+
+    # RPC00B coefficients, in the exact shape `rasterio.rpc.RPC(**rpc_coefficients)`
+    # expects (the same field names: long_off, long_scale, line_num_coeff, ...). Only
+    # set when georeferencing_kind == RPC.
+    rpc_coefficients = models.JSONField(null=True, blank=True)
 
     width = models.PositiveIntegerField()
     height = models.PositiveIntegerField()
@@ -51,6 +93,10 @@ class RasterSource(TimestampedModel):
 
     @property
     def affine(self):
+        assert self.georeferencing_kind == GeoreferencingKind.AFFINE, (
+            f"RasterSource {self.pk} is {self.georeferencing_kind}-georeferenced, "
+            "not AFFINE -- use .rpc and cvat.apps.geospatial.rpc instead"
+        )
         from affine import Affine
 
         return Affine(
@@ -61,6 +107,15 @@ class RasterSource(TimestampedModel):
             self.transform_e,
             self.transform_f,
         )
+
+    @property
+    def rpc(self):
+        assert self.georeferencing_kind == GeoreferencingKind.RPC, (
+            f"RasterSource {self.pk} is {self.georeferencing_kind}-georeferenced, not RPC"
+        )
+        from rasterio.rpc import RPC
+
+        return RPC(**self.rpc_coefficients)
 
 
 class RasterTile(models.Model):

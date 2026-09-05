@@ -6,8 +6,6 @@ from __future__ import annotations
 
 from django.http import Http404
 from django.shortcuts import get_object_or_404
-from rasterio.crs import CRS
-from rasterio.warp import transform as warp_transform
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -15,9 +13,7 @@ from rest_framework.views import APIView
 
 from cvat.apps.engine.models import Task
 from cvat.apps.geospatial.models import RasterTile
-from cvat.apps.geospatial.transforms import tile_pixel_to_geo
-
-WGS84 = CRS.from_epsg(4326)
+from cvat.apps.geospatial.services import pixel_pairs_to_wgs84
 
 
 def _user_can_view_task(user, task: Task) -> bool:
@@ -67,21 +63,16 @@ class TaskGeospatialFramesView(APIView):
         if not tiles:
             raise Http404
 
-        src_crs = CRS.from_wkt(tiles[0].raster_source.crs_wkt)
-
         frames = []
         for tile in tiles:
             tile_spec = tile.to_tile_spec()
-            transform = tile.raster_source.affine
             corners_px = [
                 (0, 0),
                 (tile.width, 0),
                 (0, tile.height),
                 (tile.width, tile.height),
             ]
-            native_pairs = [tile_pixel_to_geo(transform, tile_spec, x, y) for x, y in corners_px]
-            xs, ys = zip(*native_pairs)
-            lons, lats = warp_transform(src_crs, WGS84, xs, ys)
+            geo_corners = pixel_pairs_to_wgs84(tile.raster_source, tile_spec, corners_px)
 
             frames.append(
                 {
@@ -89,10 +80,10 @@ class TaskGeospatialFramesView(APIView):
                     "width": tile.width,
                     "height": tile.height,
                     "corners": {
-                        "top_left": [lons[0], lats[0]],
-                        "top_right": [lons[1], lats[1]],
-                        "bottom_left": [lons[2], lats[2]],
-                        "bottom_right": [lons[3], lats[3]],
+                        "top_left": list(geo_corners[0]),
+                        "top_right": list(geo_corners[1]),
+                        "bottom_left": list(geo_corners[2]),
+                        "bottom_right": list(geo_corners[3]),
                     },
                 }
             )

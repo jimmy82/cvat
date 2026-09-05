@@ -26,7 +26,6 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.errors import RasterioIOError
 from rasterio.transform import from_gcps
-from rasterio.warp import calculate_default_transform, reproject
 from rasterio.windows import Window
 
 DEFAULT_TILE_SIZE = 1024
@@ -81,63 +80,23 @@ def is_georeferenced_raster(path: Path) -> bool:
         return False
 
 
-def needs_rpc_warp(dataset: rasterio.DatasetReader) -> bool:
+def needs_rpc_georeferencing(dataset: rasterio.DatasetReader) -> bool:
     """True if `dataset`'s only usable georeferencing is an RPC (Rational Polynomial
     Coefficients) model -- common for raw satellite/aerial imagery -- rather than a
     direct affine transform or GCPs. RPCs relate *ground* coordinates to image pixels
     through a pair of cubic rational polynomials (plus a sensor-dependent, generally
     non-affine correction across the scene), not a single affine transform, so there's
-    no equivalent to `resolve_georeferencing`'s GCP handling here: the raster has to
-    actually be warped (see `warp_rpc_to_geotiff`) onto a real geographic grid before
-    any of this app's pixel<->geo math applies to it.
+    no equivalent to `resolve_georeferencing`'s GCP handling here.
+
+    The raster is tiled from its own native pixel grid exactly like any other
+    GeoTIFF -- deliberately *not* pre-warped onto an affine grid, which would resample
+    every pixel through an approximation and change the raster's own dimensions.
+    Instead, `cvat.apps.geospatial.rpc` evaluates the RPC model directly (forward for
+    ground->image, an iterative inverse for image->ground) wherever a pixel<->geo
+    conversion is actually needed -- see `RasterSource.rpc` and
+    `GeoreferencingKind.RPC`.
     """
     return resolve_georeferencing(dataset) is None and bool(dataset.rpcs)
-
-
-def warp_rpc_to_geotiff(src_path: Path, dst_path: Path) -> Path:
-    """Reproject an RPC-referenced raster onto a real WGS84 grid, producing an ordinary
-    directly-georeferenced GeoTIFF at `dst_path`. From that point on, the raster needs no
-    special handling anywhere else in this app -- `resolve_georeferencing` picks up its
-    (now direct) affine transform + CRS the same as any other GeoTIFF.
-
-    Uses `rasterio`'s own RPC-aware warp support (`rpcs=` on `calculate_default_transform`
-    and `reproject`), which asks GDAL to evaluate the RPC model itself (accurate across
-    the whole scene, unlike this app's 4-corner GCP affine fit) rather than approximating
-    it. `src_crs=None` is intentional: RPC ground coordinates are geographic WGS84 by the
-    RPC00B/RPC01B specification, independent of whatever placeholder CRS a dataset's own
-    `.crs`/`.transform` might carry (see the docstring on `needs_rpc_warp`'s caller).
-    A flat height of 0 is assumed (GDAL's default) rather than draping onto a DEM, which
-    is a real accuracy limit on terrain with significant relief -- acceptable for
-    annotation purposes, not for survey-grade measurement.
-    """
-    dst_crs = CRS.from_epsg(4326)
-    with rasterio.open(src_path) as src:
-        rpcs = src.rpcs
-        transform, width, height = calculate_default_transform(
-            None, dst_crs, src.width, src.height, rpcs=rpcs
-        )
-        profile = src.profile.copy()
-        profile.update(
-            driver="GTiff",
-            crs=dst_crs,
-            transform=transform,
-            width=width,
-            height=height,
-        )
-
-        with rasterio.open(dst_path, "w", **profile) as dst:
-            for band_index in range(1, src.count + 1):
-                reproject(
-                    source=rasterio.band(src, band_index),
-                    destination=rasterio.band(dst, band_index),
-                    src_crs=None,
-                    rpcs=rpcs,
-                    dst_transform=transform,
-                    dst_crs=dst_crs,
-                    resampling=Resampling.bilinear,
-                )
-
-    return dst_path
 
 
 @dataclass(frozen=True)
@@ -254,12 +213,14 @@ def ensure_cog(src_path: Path, dst_path: Path) -> Path:
             profile.update(driver="GTiff", tiled=True, blockxsize=512, blockysize=512)
             with rasterio.open(dst_path, "w", **profile) as dst:
                 dst.write(src.read())
-                # `.profile` only covers crs/transform, not GCPs -- carry those over
-                # explicitly so a GCP-georeferenced source doesn't lose its
+                # `.profile` only covers crs/transform, not GCPs or RPCs -- carry those
+                # over explicitly so a GCP- or RPC-georeferenced source doesn't lose its
                 # georeferencing entirely when this fallback path is taken.
                 gcps, gcp_crs = src.gcps
                 if gcps:
                     dst.gcps = (gcps, gcp_crs)
+                if src.rpcs:
+                    dst.rpcs = src.rpcs
                 dst.build_overviews([2, 4, 8, 16], Resampling.average)
                 dst.update_tags(ns="rio_overview", resampling="average")
             return dst_path

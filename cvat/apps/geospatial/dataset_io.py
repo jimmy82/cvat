@@ -32,17 +32,13 @@ from __future__ import annotations
 import io
 import json
 
-from rasterio.crs import CRS
-from rasterio.warp import transform as warp_transform
 from rest_framework.serializers import ValidationError
 
 from cvat.apps.dataset_manager.bindings import CommonData, JobData
 from cvat.apps.dataset_manager.formats.registry import exporter, importer
 from cvat.apps.engine.models import Job, JobType, ShapeType, StateChoice
 from cvat.apps.geospatial.models import RasterTile
-from cvat.apps.geospatial.transforms import geo_to_tile_pixel, tile_pixel_to_geo
-
-WGS84 = CRS.from_epsg(4326)
+from cvat.apps.geospatial.services import pixel_pairs_to_wgs84, wgs84_pairs_to_tile_pixel
 
 # Maps a CVAT shape type to the flat tile-pixel `points` it carries into the closed-ring
 # (or open, for polylines/points) list of (x, y) pairs that make up its geometry, in the
@@ -72,6 +68,8 @@ def _to_geojson_geometry(geojson_type: str, geo_pairs: list[tuple[float, float]]
     return {"type": geojson_type, "coordinates": geo_pairs}
 
 
+
+
 def _tiles_for_task(db_task, *, action: str) -> dict:
     """RasterTile rows for `db_task`, keyed by frame. Raises `ValidationError` if the
     task wasn't ingested from a GeoTIFF (i.e. has no `RasterSource`), since tile-pixel
@@ -98,7 +96,6 @@ def build_feature_collection(instance_data: CommonData) -> dict:
 
     db_task = instance_data._db_task
     tiles_by_frame = _tiles_for_task(db_task, action="export")
-    src_crs = CRS.from_wkt(next(iter(tiles_by_frame.values())).raster_source.crs_wkt)
 
     features = []
     # `include_empty=True`: `group_by_frame()` asserts on streamed annotation IRs
@@ -115,7 +112,6 @@ def build_feature_collection(instance_data: CommonData) -> dict:
             continue
 
         tile_spec = tile.to_tile_spec()
-        transform = tile.raster_source.affine
 
         for shape in frame.labeled_shapes:
             geometry_spec = _shape_pixel_rings(shape.type, shape.points)
@@ -123,10 +119,7 @@ def build_feature_collection(instance_data: CommonData) -> dict:
                 continue
             geojson_type, pixel_pairs = geometry_spec
 
-            native_pairs = [tile_pixel_to_geo(transform, tile_spec, x, y) for x, y in pixel_pairs]
-            xs, ys = zip(*native_pairs)
-            lons, lats = warp_transform(src_crs, WGS84, xs, ys)
-            geo_pairs = list(zip(lons, lats))
+            geo_pairs = pixel_pairs_to_wgs84(tile.raster_source, tile_spec, pixel_pairs)
 
             features.append(
                 {
@@ -227,7 +220,6 @@ def _import(src_file, temp_dir, instance_data: CommonData, load_data_callback=No
 
     db_task = instance_data._db_task
     tiles = list(_tiles_for_task(db_task, action="import").values())
-    src_crs = CRS.from_wkt(tiles[0].raster_source.crs_wkt)
 
     feature_collection = json.load(io.TextIOWrapper(src_file, encoding="utf-8"))
 
@@ -238,12 +230,9 @@ def _import(src_file, temp_dir, instance_data: CommonData, load_data_callback=No
         if not label_name:
             raise ValidationError(f"A GeoJSON feature is missing a 'label' property: {feature}")
 
-        geo_pairs = _feature_geo_pairs(geometry)
-        lons, lats = zip(*geo_pairs)
         # RFC 7946: input is always WGS84 lon/lat, regardless of any legacy `crs`
         # member the file might carry -- see the module docstring.
-        xs, ys = warp_transform(WGS84, src_crs, lons, lats)
-        native_pairs = list(zip(xs, ys))
+        geo_pairs = _feature_geo_pairs(geometry)
 
         # A shape must land entirely within one tile's frame to become one CVAT shape;
         # try every tile and use the first whose window contains every point. Tiles can
@@ -252,10 +241,8 @@ def _import(src_file, temp_dir, instance_data: CommonData, load_data_callback=No
         # unspecified, same as it would be for an annotator drawing directly on the
         # overlap region.
         for tile in tiles:
-            transform = tile.raster_source.affine
-            tile_spec = tile.to_tile_spec()
-            tile_pixel_pairs = [geo_to_tile_pixel(transform, tile_spec, x, y) for x, y in native_pairs]
-            if all(pair is not None for pair in tile_pixel_pairs):
+            tile_pixel_pairs = wgs84_pairs_to_tile_pixel(tile.raster_source, tile.to_tile_spec(), geo_pairs)
+            if tile_pixel_pairs is not None:
                 break
         else:
             raise ValidationError(
