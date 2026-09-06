@@ -32,13 +32,18 @@ from __future__ import annotations
 import io
 import json
 
+import shapely.geometry as shapely_geom
 from rest_framework.serializers import ValidationError
 
 from cvat.apps.dataset_manager.bindings import CommonData, JobData
 from cvat.apps.dataset_manager.formats.registry import exporter, importer
 from cvat.apps.engine.models import Job, JobType, ShapeType, StateChoice
 from cvat.apps.geospatial.models import RasterTile
-from cvat.apps.geospatial.services import pixel_pairs_to_wgs84, wgs84_pairs_to_tile_pixel
+from cvat.apps.geospatial.services import (
+    pixel_pairs_to_wgs84,
+    wgs84_pairs_to_raster_pixel,
+    wgs84_pairs_to_tile_pixel,
+)
 
 # Maps a CVAT shape type to the flat tile-pixel `points` it carries into the closed-ring
 # (or open, for polylines/points) list of (x, y) pairs that make up its geometry, in the
@@ -213,6 +218,82 @@ def _feature_geo_pairs(geometry: dict) -> list[tuple[float, float]]:
     )
 
 
+def _tile_raster_box(tile: RasterTile) -> shapely_geom.base.BaseGeometry:
+    """The tile's full pixel window (including its blank padding area, out to
+    `tile_size` on every edge) in raster-pixel space, matching the same clamp
+    `raster_pixel_to_tile_pixel` already applies for the single-tile fast path."""
+    tile_spec = tile.to_tile_spec()
+    return shapely_geom.box(
+        tile.col_off, tile.row_off, tile.col_off + tile_spec.tile_size, tile.row_off + tile_spec.tile_size
+    )
+
+
+def _iter_geoms(geometry: shapely_geom.base.BaseGeometry, of_type: type):
+    """Flatten a Polygon/MultiPolygon/LineString/MultiLineString/GeometryCollection (the
+    possible results of clipping a subject geometry against an axis-aligned box) down to
+    its individual `of_type` parts, dropping empty/degenerate slivers."""
+    if geometry.is_empty:
+        return
+    if isinstance(geometry, of_type):
+        measure = geometry.area if isinstance(geometry, shapely_geom.Polygon) else geometry.length
+        if measure > 0:
+            yield geometry
+    elif isinstance(geometry, (shapely_geom.MultiPolygon, shapely_geom.MultiLineString, shapely_geom.GeometryCollection)):
+        for part in geometry.geoms:
+            yield from _iter_geoms(part, of_type)
+
+
+def _to_tile_local_flat_points(coords, tile: RasterTile) -> list[float]:
+    flat: list[float] = []
+    for x, y in coords:
+        flat.append(x - tile.col_off)
+        flat.append(y - tile.row_off)
+    return flat
+
+
+def _clip_feature_to_tiles(geojson_type: str, raster_pixel_pairs: list[tuple[float, float]], tiles: list[RasterTile]):
+    """A feature that doesn't fit entirely within any single tile (e.g. one drawn against
+    the whole raster's extent rather than a specific tile) is split across every tile it
+    overlaps instead of being rejected outright: the geometry is clipped to each tile's
+    pixel window, and one CVAT shape is yielded per tile per resulting piece.
+
+    Yields `(tile, ShapeType, flat_tile_local_points)`. A concave polygon or a line that
+    exits and re-enters a tile can produce more than one piece for the same tile -- each
+    becomes its own CVAT shape, since a single shape can't represent disjoint geometry.
+    """
+    if geojson_type == "Polygon":
+        subject = shapely_geom.Polygon(raster_pixel_pairs)
+    elif geojson_type == "LineString":
+        subject = shapely_geom.LineString(raster_pixel_pairs)
+    else:
+        subject = shapely_geom.MultiPoint(raster_pixel_pairs)
+
+    for tile in tiles:
+        box = _tile_raster_box(tile)
+        if not subject.intersects(box):
+            continue
+        clipped = subject.intersection(box)
+
+        if geojson_type == "Polygon":
+            for part in _iter_geoms(clipped, shapely_geom.Polygon):
+                coords = list(part.exterior.coords)[:-1]  # drop the closing duplicate point
+                yield tile, ShapeType.POLYGON, _to_tile_local_flat_points(coords, tile)
+        elif geojson_type == "LineString":
+            for part in _iter_geoms(clipped, shapely_geom.LineString):
+                yield tile, ShapeType.POLYLINE, _to_tile_local_flat_points(part.coords, tile)
+        else:
+            points = (
+                [clipped]
+                if isinstance(clipped, shapely_geom.Point)
+                else list(clipped.geoms)
+                if hasattr(clipped, "geoms")
+                else []
+            )
+            coords = [(p.x, p.y) for p in points if isinstance(p, shapely_geom.Point)]
+            if coords:
+                yield tile, ShapeType.POINTS, _to_tile_local_flat_points(coords, tile)
+
+
 @importer(name="GeoJSON", version="1.0", ext="GEOJSON")
 def _import(src_file, temp_dir, instance_data: CommonData, load_data_callback=None, **kwargs):
     if load_data_callback is not None:
@@ -225,39 +306,65 @@ def _import(src_file, temp_dir, instance_data: CommonData, load_data_callback=No
 
     for feature in feature_collection.get("features", []):
         geometry = feature["geometry"]
+        geojson_type = geometry["type"]
         properties = feature.get("properties") or {}
         label_name = properties.get("label")
         if not label_name:
             raise ValidationError(f"A GeoJSON feature is missing a 'label' property: {feature}")
+        occluded = bool(properties.get("occluded", False))
 
         # RFC 7946: input is always WGS84 lon/lat, regardless of any legacy `crs`
         # member the file might carry -- see the module docstring.
         geo_pairs = _feature_geo_pairs(geometry)
 
-        # A shape must land entirely within one tile's frame to become one CVAT shape;
-        # try every tile and use the first whose window contains every point. Tiles can
-        # overlap (see `RasterSource.overlap`), so a shape near a shared edge may
-        # legitimately fit more than one -- which tile "wins" in that case is
-        # unspecified, same as it would be for an annotator drawing directly on the
-        # overlap region.
+        # Fast path: a shape that lands entirely within one tile's frame becomes one
+        # CVAT shape, unfragmented -- true for any shape actually drawn against a single
+        # tile (including everything a round-trip export produces). Tiles can overlap
+        # (see `RasterSource.overlap`), so a shape near a shared edge may legitimately
+        # fit more than one -- which tile "wins" in that case is unspecified, same as it
+        # would be for an annotator drawing directly on the overlap region.
+        placed = False
         for tile in tiles:
             tile_pixel_pairs = wgs84_pairs_to_tile_pixel(tile.raster_source, tile.to_tile_spec(), geo_pairs)
             if tile_pixel_pairs is not None:
+                instance_data.add_shape(
+                    instance_data.LabeledShape(
+                        type=_GEOJSON_TYPE_TO_SHAPE_TYPE[geojson_type],
+                        frame=tile.frame,
+                        points=[coord for pair in tile_pixel_pairs for coord in pair],
+                        label=label_name,
+                        occluded=occluded,
+                        attributes=[],
+                        source="file",
+                    )
+                )
+                placed = True
                 break
-        else:
-            raise ValidationError(
-                "A GeoJSON feature doesn't fit within any single tile's frame -- it may "
-                f"straddle a tile boundary, or fall outside the raster entirely: {feature}"
+
+        if placed:
+            continue
+
+        # Doesn't fit in any single tile -- e.g. drawn against the whole raster's
+        # extent rather than one tile. Split it across every tile it overlaps instead
+        # of rejecting it, clipping the geometry to each tile's pixel window.
+        raster_pixel_pairs = wgs84_pairs_to_raster_pixel(tiles[0].raster_source, geo_pairs)
+        split_into_any = False
+        for tile, shape_type, flat_points in _clip_feature_to_tiles(geojson_type, raster_pixel_pairs, tiles):
+            split_into_any = True
+            instance_data.add_shape(
+                instance_data.LabeledShape(
+                    type=shape_type,
+                    frame=tile.frame,
+                    points=flat_points,
+                    label=label_name,
+                    occluded=occluded,
+                    attributes=[],
+                    source="file",
+                )
             )
 
-        instance_data.add_shape(
-            instance_data.LabeledShape(
-                type=_GEOJSON_TYPE_TO_SHAPE_TYPE[geometry["type"]],
-                frame=tile.frame,
-                points=[coord for pair in tile_pixel_pairs for coord in pair],
-                label=label_name,
-                occluded=bool(properties.get("occluded", False)),
-                attributes=[],
-                source="file",
+        if not split_into_any:
+            raise ValidationError(
+                "A GeoJSON feature doesn't overlap any tile of this task's raster at "
+                f"all: {feature}"
             )
-        )

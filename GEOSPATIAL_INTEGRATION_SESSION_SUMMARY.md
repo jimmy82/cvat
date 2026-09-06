@@ -166,6 +166,33 @@ More real usage surfaced more gaps, each fixed and re-verified against the live 
   summary document, per the user's explicit request to capture the full history for
   anyone else looking at the pushed branch.
 
+## Phase 5 — Importing whole-raster annotations
+
+The user tried importing a fresh GeoJSON annotation drawn against the whole image
+rather than one tile, and CVAT rejected it: the importer only ever checked whether a
+feature fit entirely inside a single tile's pixel window.
+
+- Added `services.wgs84_pairs_to_raster_pixel()` — the untiled counterpart of
+  `wgs84_pairs_to_tile_pixel()`, converting WGS84 coordinates to raster-pixel space
+  across the whole source raster (dispatching on `georeferencing_kind` the same way),
+  rather than one tile's clamped window.
+- `dataset_io._import` now falls back to clipping when a feature doesn't fit in any
+  single tile: convert to raster-pixel space, then intersect (via `shapely`, already a
+  transitive dependency) against every tile's pixel window it overlaps, emitting one
+  CVAT shape per tile per resulting piece — a polygon/rectangle spanning multiple tiles
+  is clipped into one shape per tile; a polyline crossing a boundary is split at the
+  boundary; multi-point features are bucketed by which tile each point falls in. Shapes
+  that already fit a single tile are unaffected (same fast path as before).
+- Verified the clipping math against a synthetic two-tile scenario before redeploying.
+- **Redeploy hit an unrelated port conflict**: rebuilding required including
+  `docker-compose.dev.yml` (the base `docker-compose.yml` only references pre-built
+  `image:` tags, not a `build:` section — a wasted first rebuild attempt discovered
+  this). Including it triggered a recreate of `cvat_db`, which then failed to bind host
+  port 5432 because a local, non-Docker Postgres.app instance had grabbed it in the
+  interim. Asked the user how to proceed rather than acting unilaterally on their
+  machine; they chose to stop the local Postgres.app process, which was then done and
+  the stack redeployed successfully.
+
 ## Key files touched
 
 - `cvat/apps/geospatial/` — GeoTIFF ingestion/tiling, coordinate transforms, GeoJSON

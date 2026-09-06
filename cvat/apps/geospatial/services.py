@@ -27,6 +27,7 @@ from cvat.apps.geospatial.ingestion import (
 from cvat.apps.geospatial.models import GeoreferencingKind, RasterSource, RasterTile
 from cvat.apps.geospatial.rpc import rpc_forward, rpc_inverse
 from cvat.apps.geospatial.transforms import (
+    geo_to_raster_pixel,
     geo_to_tile_pixel,
     raster_pixel_to_tile_pixel,
     tile_pixel_to_geo,
@@ -160,6 +161,26 @@ def pixel_pairs_to_wgs84(
     src_crs = CRS.from_wkt(raster_source.crs_wkt)
     lons, lats = warp_transform(src_crs, WGS84, xs, ys)
     return list(zip(lons, lats))
+
+
+def wgs84_pairs_to_raster_pixel(
+    raster_source: RasterSource, geo_pairs: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """WGS84 (lon, lat) pairs -> raster-pixel (col, row) pairs across the *whole* source
+    raster -- no per-tile windowing or clamping, unlike `wgs84_pairs_to_tile_pixel`.
+
+    Used when a feature needs to be tested against, and potentially clipped to, every
+    tile's window at once (a feature spanning the whole raster rather than fitting in
+    one tile) -- see `cvat.apps.geospatial.dataset_io`'s multi-tile import fallback.
+    """
+    if raster_source.georeferencing_kind == GeoreferencingKind.RPC:
+        rpc = raster_source.rpc
+        return [rpc_forward(rpc, lon, lat) for lon, lat in geo_pairs]
+
+    src_crs = CRS.from_wkt(raster_source.crs_wkt)
+    lons, lats = zip(*geo_pairs)
+    xs, ys = warp_transform(WGS84, src_crs, lons, lats)
+    return [geo_to_raster_pixel(raster_source.affine, x, y) for x, y in zip(xs, ys)]
 
 
 def wgs84_pairs_to_tile_pixel(
