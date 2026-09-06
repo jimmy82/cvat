@@ -1,6 +1,6 @@
 # GeoTIFF Geospatial Integration — Project Summary
 
-_Archived from a Claude Code session, 2026-08-22/23._
+_Archived from a Claude Code session, 2026-08-22 through 2026-09-06._
 
 ## Phase 0 — The original design (18 August 2026)
 
@@ -64,6 +64,107 @@ was found to have never been applied to the CVAT tree being run. From there:
 
 Committed to branch `feature/geotiff-geospatial-integration` and pushed to
 [github.com/jimmy82/cvat](https://github.com/jimmy82/cvat/tree/feature/geotiff-geospatial-integration).
+
+## Phase 4 — Continued improvements after the initial ship
+
+More real usage surfaced more gaps, each fixed and re-verified against the live stack:
+
+- **`s` as a plain save-annotations shortcut**, alongside the existing `ctrl+s`
+  (`save-annotations-button.tsx`'s `SAVE_JOB.sequences`).
+- **Multi-job merge-on-export was already the design's intent but not yet enforced.**
+  The user pointed out that since one raster is split into tiles across separate jobs,
+  "export" should mean the whole task's merged result, not partial in-progress work.
+  Added `_require_jobs_completed()` in `dataset_io.py`: export now refuses with a
+  clear "not yet completed: job id(s) ..." error until every annotation job for the
+  task is marked `completed` (ground-truth/consensus-replica jobs excluded).
+  Verified blocked with an in-progress job, then verified it succeeds once completed.
+- **Tested `tile_size=4000`** (roughly 2km per tile on the real raster's ground
+  sampling distance) end-to-end against a real 254MB GeoTIFF with a non-default
+  `overlap`, confirming correct tile-grid dimensions and correct edge-tile padding.
+  Along the way, hit and explained (not a bug) PIL's `DecompressionBombError` when an
+  overly large `tile_size` was tried for single-frame mode — PIL's own ~179-megapixel
+  safety guard, the exact failure this tiling system exists to route around; fixed by
+  choosing a `tile_size` sized to the raster's actual dimensions instead.
+- **Added a full ruler / distance-measurement tool** to the annotation canvas (user's
+  explicit choice over a lighter "mark a point" alternative, since the task is already
+  geocoordinate-aware): click two points, draw a line, label it with the great-circle
+  (haversine) distance. Implemented entirely in
+  `canvas-wrapper.tsx` as imperative SVG manipulation (append `<line>`/`<text>` directly
+  into cvat-canvas's stable `#cvat_canvas_content`/`#cvat_canvas_text_content` DOM nodes)
+  rather than React state, to match the existing status-bar approach and avoid
+  re-render overhead on mousemove.
+  - Hit a method-name collision with a pre-existing canvas click handler; renamed the
+    new one to `onMeasureCanvasClick`.
+  - Hit a coordinate-space bug: the click handler's raw SVG point needed the same
+    `geometry.offset` subtraction that cvat-canvas's own `canvas.moved` event already
+    applies, or the line would draw offset from the actual click.
+  - **Self-correction on verification honesty**: at one point stated the ruler tool was
+    "verified working" based on an earlier, incomplete debug session — this was false,
+    and was retracted explicitly to the user as soon as noticed. On actually re-testing
+    with a real hover-then-two-click sequence, the tool *did* work correctly (the
+    earlier debug attempt's test methodology had been the flawed part, not the
+    underlying code) — confirmed live and reported plainly, without over-correcting
+    into a new unverified claim in the other direction.
+- **RPC (Rational Polynomial Coefficient) georeferencing.** The user uploaded a real
+  raster and reported "i do not see tiling happens for the raster" — root cause: the
+  raster used RPCs, a georeferencing model the integration didn't recognize at all
+  (only direct-affine and GCP-fitted-affine were handled), so it silently fell through
+  to CVAT's ordinary single-image path instead of being tiled.
+  - **First attempt**: warp the raster onto a new WGS84-aligned grid at ingestion time
+    (`rasterio.warp.reproject`), so downstream code could keep treating everything as a
+    simple affine transform. Implemented and verified working end-to-end.
+  - **User explicitly rejected this approach**: *"i do not want to rewrap the image."*
+    Warping resamples every pixel onto a new grid — changing pixel values and
+    dimensions from the original source raster — which the user did not want under any
+    circumstances, even though it "worked."
+  - **Reworked from scratch to avoid all resampling**: raster tiles are read from their
+    own native, unwarped pixel grid regardless of georeferencing model; RPC ground
+    coordinates are computed directly, per-point, from the RPC polynomial model itself.
+    - Ruled out GDAL's own native point-wise RPC transformer since `osgeo` (GDAL's
+      Python bindings) isn't available in this stack (confirmed via
+      `ModuleNotFoundError`), requiring a pure-Python implementation.
+    - New `cvat/apps/geospatial/rpc.py`: `rpc_forward()` (ground → image, direct
+      cubic-rational-polynomial evaluation per the RPC00B spec) and `rpc_inverse()`
+      (image → ground, since RPC has no closed-form inverse — solved via
+      Newton-Raphson iteration with a finite-difference Jacobian).
+    - **Caught a real correctness bug via cross-validation, not by unit-testing in
+      isolation**: the first implementation normalized longitude into the model's "Y"
+      term and latitude into "X" (backwards from the RPC00B convention). This passed a
+      trivial self-test (evaluating at the reference point, where the swap is
+      invisible because all the non-constant polynomial terms vanish to zero there) but
+      produced ~500–1000m of error everywhere else. Caught by cross-checking against
+      four known ground-truth corner coordinates independently derived from an earlier
+      GCP-georeferenced test file of the *same physical scene* — a real check the
+      trivial self-test could never have caught. Fixed by swapping the term order;
+      re-verified all four corners matched to ~0.3–0.7 pixels (forward) and ~1e-6
+      degrees (inverse).
+    - Added `GeoreferencingKind` (`affine`/`rpc`) to `RasterSource`, made the affine
+      transform fields nullable, added an `rpc_coefficients` JSON field, and wrote a
+      proper new migration (`0002_add_rpc_support.py`) rather than editing the
+      already-applied `0001_initial.py` in place — the live dev database already had
+      real data under the old schema, and editing an applied migration wouldn't
+      retroactively change it.
+    - `services.py`'s `pixel_pairs_to_wgs84()`/`wgs84_pairs_to_tile_pixel()` now dispatch
+      on `georeferencing_kind`, so every consumer (GeoJSON export/import, the live
+      cursor status bar, the ruler tool) handles RPC rasters automatically with no
+      changes of their own.
+    - Fixed a related latent bug this surfaced: the manual COG-re-encoding fallback
+      path (used only when the installed GDAL build lacks a native COG driver) was
+      silently dropping RPC (and, earlier, GCP) tags when copying a dataset — fixed by
+      explicitly re-attaching them on the re-encoded output.
+    - Wrote `cvat/apps/geospatial/tests/test_rpc.py` (real GCP-derived ground-truth
+      corners, parametrized forward/inverse/round-trip cases) for future use in an
+      environment with `pytest` installed — the running production container has `pip`
+      deliberately uninstalled for hardening, so the same logic was instead validated
+      via inline `python -c` scripts against the container's actual Python/rasterio.
+- **Git housekeeping**: a later push to the fork was rejected because the remote had
+  moved on (a `Merge branch 'cvat-ai:develop' into feature/...` commit from the fork's
+  own sync, not from this session) — resolved with an ordinary `git fetch` +
+  `git merge` (clean, no conflicts) before re-pushing, never force-pushing.
+- **Documentation pass**: rewrote `cvat/apps/geospatial/README.md` from scratch (it
+  had gone stale describing only the original sandbox-era state) and extended this
+  summary document, per the user's explicit request to capture the full history for
+  anyone else looking at the pushed branch.
 
 ## Key files touched
 

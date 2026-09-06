@@ -1,117 +1,154 @@
 # cvat.apps.geospatial
 
-GeoTIFF ingestion and tiling for CVAT. Implements Phase 1 of the
-`CVAT_GeoTIFF_ML_Integration_Design.md` design doc: teaches CVAT to accept large,
-georeferenced rasters by tiling them into a synthetic sequence of CVAT "frames" that
-reuse CVAT's existing job/segment splitting logic unmodified.
+GeoTIFF ingestion, tiling, and geocoordinate export/import for CVAT. Teaches CVAT to
+accept large, georeferenced rasters by tiling them into a synthetic sequence of CVAT
+"frames" that reuse CVAT's existing job/segment splitting logic unmodified, and to
+convert annotations between tile-pixel space and real-world coordinates in both
+directions.
+
+Originally scaffolded against a design doc (`CVAT_GeoTIFF_ML_Integration_Design.md`)
+and built/tested in a sandbox with no live CVAT stack. This README describes the
+**current, live-verified state** after that work was actually merged into the real
+source tree, run against a real Docker stack, and extended -- see
+`GEOSPATIAL_INTEGRATION_SESSION_SUMMARY.md` at the repo root for the full history of
+what that took.
 
 ## How it fits together
 
 * **`ingestion.py`** — pure, Django-free tiling primitives: `build_tile_grid`,
-  `read_tile_as_png_bytes`, `ensure_cog`, `is_georeferenced_raster`, etc. Built on
-  `rasterio` (GDAL) windowed reads specifically to avoid the whole-file PIL decode that
-  fails on very large TIFFs today (see
-  [cvat-ai/cvat#531](https://github.com/cvat-ai/cvat/issues/531) and
-  [#2205](https://github.com/cvat-ai/cvat/issues/2205)). Fully unit tested with no
-  Django/database dependency — see `tests/test_ingestion.py` and
-  `tests/test_transforms.py`.
+  `read_tile_as_png_bytes`, `ensure_cog`, `is_georeferenced_raster`,
+  `resolve_georeferencing`, `needs_rpc_georeferencing`, etc. Built on `rasterio` (GDAL)
+  windowed reads specifically to avoid the whole-file PIL decode that fails on very
+  large TIFFs (see [cvat-ai/cvat#531](https://github.com/cvat-ai/cvat/issues/531) and
+  [#2205](https://github.com/cvat-ai/cvat/issues/2205)). A raster is tiled from its own
+  native pixel grid regardless of which georeferencing model it uses below -- nothing
+  in this app ever resamples/warps the source imagery.
 * **`transforms.py`** — pure coordinate conversion between tile-pixel, raster-pixel,
-  and geographic (CRS) space, for converting annotations back to real-world
-  coordinates.
+  and geographic (CRS) space for **affine-georeferenced** rasters (a direct transform,
+  or a GCP-fitted one -- both are a single linear mapping).
+* **`rpc.py`** — pure RPC (Rational Polynomial Coefficients) math for
+  **RPC-georeferenced** rasters (common raw satellite/aerial imagery): forward
+  evaluation (ground -> image) and an iterative Newton-Raphson inverse (image ->
+  ground), since RPC has no direct affine equivalent and no closed-form inverse. Getting
+  the polynomial term order right needed real-data validation, not just a
+  round-trip-through-itself check -- see the module docstring and `tests/test_rpc.py`.
 * **`media_extractor.py`** — `GeoTiffTileReader`, a `cvat.apps.engine.media_extractors
   .ImageListReader` subclass that "unrolls" one GeoTIFF into N tile frames, exactly the
   way `ArchiveReader`/`DirectoryReader` already unroll one archive/directory into many
   frames. Registers itself as a new `"geotiff"` entry in
   `cvat.apps.engine.media_extractors.MEDIA_TYPES` (ordered *before* `"image"` so a
   georeferenced TIFF is claimed before the generic extension-based image check sees
-  it) via `AppConfig.ready()`.
-* **`models.py`** — `RasterSource` (one row per ingested GeoTIFF: CRS, affine
-  transform, band/dtype info), `RasterTile` (one row per tile: frame index -> pixel
-  window), `RasterTaskConfig` (per-task tiling settings).
-* **`services.py`** — `persist_raster_metadata()`, the Django-facing bridge that
-  writes a `GeoTiffTileReader`'s already-computed tile grid into the DB models above,
-  called from `cvat.apps.engine.task.initialize_task()` right after the extractor is
-  built (see the `media_type == "geotiff"` branch there).
+  it) via `AppConfig.ready()`. Materializes each tile as a real PNG file on disk at
+  ingestion time (not lazily), since CVAT's manifest generation opens frame paths
+  directly rather than going through the reader's own `get_image()`.
+* **`models.py`** — `RasterSource` (one row per ingested GeoTIFF: georeferencing_kind
+  affine/rpc, plus either affine transform + CRS or RPC coefficients, band/dtype info),
+  `RasterTile` (one row per tile: frame index -> pixel window), `RasterTaskConfig`
+  (per-task tiling settings).
+* **`services.py`** — Django-facing bridge: `persist_raster_metadata()` writes a
+  `GeoTiffTileReader`'s already-computed tile grid into the DB models above (called
+  from `cvat.apps.engine.task.initialize_task()`'s `media_type == "geotiff"` branch);
+  `pixel_pairs_to_wgs84()`/`wgs84_pairs_to_tile_pixel()` are the shared dispatch points
+  every consumer (GeoJSON export/import, the live cursor status bar, the ruler tool) goes
+  through to convert coordinates without needing to know or care whether a given
+  `RasterSource` is affine- or RPC-georeferenced.
+* **`dataset_io.py`** — registers a **"GeoJSON" export and import format** in
+  `cvat.apps.dataset_manager`'s format registry. Export produces a single WGS84
+  FeatureCollection merging every job's annotations for a task (see the job-completion
+  gate below); import reads one back, matching each feature to the tile it falls
+  within. Both directions are lossy in one specific, documented way: a CVAT rectangle
+  becomes a 4-point GeoJSON `Polygon` (a rotated rectangle has no other GeoJSON
+  representation), so anything imported back in is a CVAT `polygon`, never a
+  `rectangle`.
+* **`views.py`** — `GET /api/tasks/<id>/geospatial/frames/`, returning each frame's
+  WGS84 corner coordinates. Consumed by the frontend's live cursor-position status bar
+  and the click-two-points ruler/distance-measurement tool (both in `cvat-ui`, outside
+  this app -- see `cvat-ui/src/components/annotation-page/canvas/views/canvas2d
+  /canvas-wrapper.tsx`).
 
-## Verifying this in the CVAT dev stack
+## Georeferencing models supported
 
-Migrations: `python manage.py migrate geospatial`. `rasterio` needs adding to
-`cvat/requirements/base.in`/`.txt` (not done automatically by this patch — see "Known
-integration gaps" below) and the Docker image needs GDAL runtime libraries, which the
-`rasterio` manylinux wheel bundles, so a plain `pip install rasterio` is normally
-sufficient without extra system packages.
+A raster can be georeferenced in any of three ways GDAL recognizes, and this app
+handles all three without ever resampling the source imagery:
 
-## How this was verified in this sandbox
+1. **Direct affine transform + CRS** — the common case. `RasterSource.affine`.
+2. **GCPs** (ground control points) — a handful of (pixel, line) <-> (x, y)
+   correspondences instead of a transform, typical of raw aerial/satellite quicklooks.
+   A single affine is *fit* from the GCPs at ingestion time
+   (`rasterio.transform.from_gcps`) and stored the same as case 1 -- from that point on
+   a GCP-georeferenced raster is indistinguishable from a directly-georeferenced one.
+3. **RPCs** (Rational Polynomial Coefficients) — common for raw satellite/aerial
+   imagery. Not a linear transform at all, so it's stored and evaluated separately
+   (see `rpc.py`); everything downstream (export, import, the status bar, the ruler
+   tool) dispatches on `RasterSource.georeferencing_kind` via `services.py`'s helpers
+   without needing its own affine/RPC branching logic.
 
-This code was developed and tested inside a cloud sandbox that could not install
-CVAT's full dependency set — most notably the exact pinned `datumaro` fork CVAT
-requires isn't fetchable here (network access to that specific GitHub commit is
-blocked, and the public PyPI `datumaro` package is a different, incompatible
-version — several unrelated CVAT apps, like `quality_control`/`consensus`, fail to
-import against it). None of that is needed by this app, so verification used a
-curated Django settings module, `dev/sandbox_verification_settings/` (see the README
-there for exactly what it changes and why), rather than `manage.py test` against the
-real 40-app `cvat.settings.testing`.
+## Job-completion gate on export
 
-What that verified for real, against a real (sqlite) Django ORM and a real
-rasterio-backed synthetic GeoTIFF:
+A raster's tiles are typically split across multiple jobs/annotators (via CVAT's
+ordinary `segment_size`), so "export the task" is meant to mean "the merged result is
+done", not "here's whatever's there right now". GeoJSON export refuses (with a clear
+error naming the unfinished job) until every annotation job for the task (excluding
+ground-truth/consensus-replica jobs) is marked `completed`.
 
-* Tile grid math (exact-multiple, padded edge tiles, overlap/stride, determinism,
-  input validation) — 32 pure unit tests, no Django needed at all.
-* COG detection/re-encoding round-trips pixel values exactly.
-* `read_tile_as_png_bytes` produces correctly-sized, correctly-padded PNGs; band
-  selection and shared brightness/contrast stats across tiles.
-* Coordinate transforms round-trip correctly in both directions (tile-pixel <->
-  raster-pixel <-> geographic), including the "point falls outside this tile" case.
-* `GeoTiffTileReader` constructed directly and iterated end-to-end against a real
-  Task/Data row: produces the expected frame count, every frame is a valid PNG at the
-  configured tile size, and `persist_raster_metadata()` writes matching `RasterSource`
-  + `RasterTile` rows, including the DB-level uniqueness constraint on
-  `(raster_source, frame)`.
+## `tile_size`/`overlap`/`reencode_as_cog` are real API + UI fields
 
-What was **not** verified against a running CVAT instance (documented gaps, not silent
-omissions):
+Settable through `POST /api/tasks/{id}/data` (validated: `overlap` must be smaller than
+`tile_size`) and through the Create Task page's Advanced Configuration section in the
+UI ("Tile size" / "Tile overlap"). Setting `tile_size` at or above the raster's own
+largest dimension (with `overlap=0`) puts the whole raster in a single frame instead of
+tiling it -- useful when a raster is small enough that CVAT's ordinary single-image
+pan/zoom canvas can show it directly, capped by PIL's own ~179-megapixel
+decompression-bomb guard (the exact failure mode this whole tiling system exists to
+avoid for anything larger).
 
-* The actual upload -> `initialize_task()` call path end-to-end through the real HTTP
-  API (task creation, chunk generation, frame serving to the browser). The
-  `media_type == "geotiff"` branch added to `cvat/apps/engine/task.py` was confirmed to
-  **import** cleanly (no circular imports, no `NameError`s) under the same curated
-  settings, but was not exercised via an actual `POST /api/tasks/{id}/data` call, which
-  would need the full stack (Postgres, Redis, a real RQ worker, ffmpeg/av) running.
-* Cloud-storage-backed uploads (`remote_files`): `_is_geotiff()`'s georeferencing check
-  needs the file to be locally readable at MIME-detection time; a GeoTIFF sitting only
-  in cloud storage at that point falls back to ordinary "image" handling rather than
-  being tiled. This is a known, documented limitation, not a crash.
-* Manifest generation, honeypot/ground-truth frame allocation, and the cloud-storage
-  manifest code paths in `task.py` were not specifically exercised against a tiled
-  GeoTIFF task — they're generic over any `IImageReader`, so they *should* work
-  unmodified, but "should" is not "verified."
+## How this was verified
 
-## Known integration gaps / follow-ups for a real deployment
+Every claim above has been exercised against a real Docker Compose stack (Postgres,
+Redis, RQ workers, a real annotator uploading real files through the actual HTTP API),
+not just unit tests against a curated settings module -- see
+`GEOSPATIAL_INTEGRATION_SESSION_SUMMARY.md` for the specifics of what was uploaded and
+what was cross-validated against independently-known ground truth for each
+georeferencing model. In brief:
 
-1. **`rasterio` has been added to `cvat/requirements/base.in`** (pinned `~=1.4`,
-   installs cleanly from a manylinux wheel with GDAL bundled in — no extra system
-   packages needed). `rasterio==1.4.4` plus its 3 small pure-Python dependencies
-   (`affine`, `click-plugins`, `cligj`) were also hand-added to `base.txt`, in the
-   right alphabetical spot with `# via` annotations, using the exact versions pip
-   actually resolved when installing `rasterio~=1.4` during this work -- this is
-   enough for a Docker build to install them correctly. What was *not* done is a real
-   `pip-compile` regeneration, so `base.txt`'s SHA1 content-hash header comment is now
-   stale/inconsistent with the file's actual contents. Run the documented
-   regeneration step (`cvat/requirements/README.txt` -> `regenerate.sh`) in a real dev
-   environment with full network access at some point to get a clean, consistent
-   lockfile -- but a build should work correctly without that being done first.
-2. **`tile_size`/`overlap`/`reencode_as_cog` aren't first-class API fields yet.**
-   `task.py` reads them via `data.get("tile_size")` etc. with sane defaults, but
-   `cvat.apps.engine.serializers.DataSerializer` doesn't declare them, so a client
-   can't actually set them through the public REST API today without that small,
-   separate serializer change (plus a `RasterTaskConfig` write path to persist the
-   *requested* settings, not just what the extractor happened to use).
-3. **No GeoJSON/shapefile export wired up yet.** `transforms.py` has everything needed
-   (`shape_tile_pixels_to_geo`) but no export-format integration exists in
-   `cvat.apps.dataset_manager` yet to actually offer it as a download option.
-4. **Multi-task splitting for extremely large scenes** (one raster split across
-   several Tasks under one Project) is discussed in the design doc as a policy option
-   but isn't implemented — today one GeoTIFF maps to exactly one Task
+* A direct-affine synthetic raster: tiling, single-frame mode, and a GeoJSON
+  export/import round-trip matching exactly.
+* A GCP-georeferenced real raster (four corner GCPs): the fitted affine reproduces all
+  four GCPs to sub-meter accuracy; export/import round-trips exactly.
+* An RPC-georeferenced real raster (same underlying scene as the GCP one, for
+  cross-validation): tiles from its own native, unwarped grid; export/import
+  round-trips exactly; a pixel's exported coordinate independently agrees with the
+  GCP-based raster's ground truth for the same physical location to ~2e-6 degrees.
+* The job-completion gate: confirmed blocked with an "in progress" job, confirmed
+  succeeding once completed.
+* `tile_size`=4000 with a non-default `overlap`: confirmed correct tile grid dimensions
+  and edge-tile padding against a real 254MB raster.
+
+## Known gaps / follow-ups for a real deployment
+
+1. **No real IAM/OPA permissions.** `TaskGeospatialFramesView` (and the GeoJSON
+   export/import format, which rides on `cvat.apps.dataset_manager`'s own permission
+   checks) use a hand-rolled visibility check mirroring
+   `cvat.apps.ml_processing.views._user_can_view_job`'s documented stand-in, not a real
+   `OpenPolicyAgentPermission` + Rego policy.
+2. **Cloud-storage-backed uploads (`remote_files`)**: `_is_geotiff()`'s georeferencing
+   check needs the file to be locally readable at MIME-detection time; a GeoTIFF
+   sitting only in cloud storage at that point falls back to ordinary "image" handling
+   rather than being tiled. Known, documented limitation, not a crash.
+3. **`RasterTaskConfig` isn't actually written to.** The model exists (per-task
+   tiling settings meant to make re-tiling reproducible) but nothing currently
+   populates it -- `tile_size`/`overlap` are read from the request and used, not
+   persisted into this table.
+4. **RPC height is always assumed flat (0), never draped onto a DEM.** A real accuracy
+   limit on terrain with significant relief; acceptable for annotation purposes, not
+   for survey-grade measurement -- see `rpc.py`'s module docstring.
+5. **Multi-task splitting for extremely large scenes** (one raster split across
+   several Tasks under one Project) is discussed in the original design doc as a
+   policy option but isn't implemented -- today one GeoTIFF maps to exactly one Task
    (`GeoTiffTileReader` raises `ValueError` if given more than one source file, by
-   design, but doesn't yet offer the "split across N tasks" path).
+   design).
+6. **No true multi-resolution/deep-zoom viewer.** A raster too large even for
+   single-frame mode (over PIL's ~179-megapixel guard once padded to a square) has no
+   option but ordinary tiling -- CVAT has no tile-pyramid/whole-slide-imaging canvas to
+   build on top of (confirmed by research during this work; would be genuine
+   greenfield work spanning both the backend and `cvat-canvas` itself).
