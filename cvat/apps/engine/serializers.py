@@ -2670,7 +2670,7 @@ class DataSerializer(serializers.ModelSerializer):
             Only used for GeoTIFF uploads: the width/height in pixels of each tile a
             georeferenced raster is split into (one tile becomes one CVAT frame).
             Set this larger than the raster's own width/height to get the whole raster
-            as a single frame instead of a tiled sequence. Defaults to 1024 if omitted.
+            as a single frame instead of a tiled sequence. Defaults to 8096 if omitted.
         """),
     )
     overlap = serializers.IntegerField(
@@ -2680,7 +2680,7 @@ class DataSerializer(serializers.ModelSerializer):
         help_text=textwrap.dedent("""\
             Only used for GeoTIFF uploads: how many pixels adjacent tiles overlap by,
             so objects straddling a tile boundary aren't fully invisible to any single
-            annotator. Must be smaller than tile_size. Defaults to 64 if omitted.
+            annotator. Must be smaller than tile_size. Defaults to 128 if omitted.
         """),
     )
     reencode_as_cog = serializers.BooleanField(

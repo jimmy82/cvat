@@ -28,8 +28,8 @@ from rasterio.errors import RasterioIOError
 from rasterio.transform import from_gcps
 from rasterio.windows import Window
 
-DEFAULT_TILE_SIZE = 1024
-DEFAULT_OVERLAP = 64
+DEFAULT_TILE_SIZE = 8096
+DEFAULT_OVERLAP = 128
 
 # Cap on how many bands we ever pull for the *display* PNG a browser renders. The
 # original bands/dtype are always readable later straight from the source raster via

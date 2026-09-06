@@ -375,7 +375,7 @@ class AdvancedConfigurationForm extends React.PureComponent<Props> {
         return (
             <CVATTooltip title={'Only used for GeoTIFF uploads: splits a georeferenced raster into ' +
                 'square tiles of this size (in pixels), one tile per frame. Set this to (at least) the ' +
-                "raster's larger dimension to get the whole raster as a single frame instead. Defaults to 1024."}
+                "raster's larger dimension to get the whole raster as a single frame instead. Defaults to 8096."}
             >
                 <Form.Item label='Tile size' name='tileSize' rules={[{ validator: isInteger({ min: 1 }) }]}>
                     <Input size='large' type='number' min={1} />
@@ -388,7 +388,7 @@ class AdvancedConfigurationForm extends React.PureComponent<Props> {
         return (
             <CVATTooltip title={'Only used for GeoTIFF uploads: how many pixels adjacent tiles overlap ' +
                 'by, so objects straddling a tile boundary are not fully invisible to any single ' +
-                'annotator. Defaults to 64.'}
+                'annotator. Defaults to 128.'}
             >
                 <Form.Item
                     label='Tile overlap'
