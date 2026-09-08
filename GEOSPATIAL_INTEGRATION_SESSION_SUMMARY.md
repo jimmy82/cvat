@@ -193,6 +193,25 @@ feature fit entirely inside a single tile's pixel window.
   machine; they chose to stop the local Postgres.app process, which was then done and
   the stack redeployed successfully.
 
+## Phase 6 — Accepting new classes on annotation upload
+
+The user asked to "accept new classes for the annotation upload" — every other CVAT
+importer rejects a `label` naming a class that isn't already declared on the target
+task/project (`InstanceLabelData._get_label_id` raises `ValueError`), which would force
+pre-declaring every class through the UI before a GeoJSON produced by an external tool
+could be imported.
+
+- Added `dataset_io._ensure_label_registered()`: checks each feature's `label` against
+  the task's (or its project's) already-known labels, and if new, creates it on the fly
+  (`type="any"`, auto-assigned color via the same `get_label_color` helper CVAT's own
+  label-creation API uses) and registers it directly into the importer's in-memory
+  label cache so the rest of the import sees it immediately.
+- Verified live against a real GeoTIFF-backed task: created a new label, confirmed
+  idempotent on a repeat call (no duplicate), cleaned up the test label afterward.
+- Also updated `dataset_io.py`'s module docstring and the app README to describe this
+  behavior, since it's a deliberate departure from every other CVAT importer's
+  behavior and worth calling out explicitly for anyone reading the code later.
+
 ## Key files touched
 
 - `cvat/apps/geospatial/` — GeoTIFF ingestion/tiling, coordinate transforms, GeoJSON

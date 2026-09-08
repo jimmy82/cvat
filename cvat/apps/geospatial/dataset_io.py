@@ -16,8 +16,12 @@ Export produces a single WGS84 (EPSG:4326) `FeatureCollection`, one `Feature` pe
 shape, with the label name and CVAT shape id carried over as feature properties. Import
 reads that same shape back (RFC 7946: input is always assumed WGS84 lon/lat, regardless
 of any legacy `crs` member the file might carry -- a deliberate scope limit, not an
-oversight) and only requires each feature to carry a `label` property naming an existing
-label on the target task; other properties are ignored.
+oversight) and only requires each feature to carry a `label` property; other properties
+are ignored. Unlike most CVAT importers, a `label` naming a class that doesn't already
+exist on the target task (or its project, if it belongs to one) isn't rejected -- it's
+registered as a new label on the fly, the first time it's seen, so a GeoJSON produced
+externally (e.g. by an ML pipeline) doesn't need its classes pre-declared in CVAT before
+it can be imported (see `_ensure_label_registered`).
 
 Both directions share the same shape-type mapping, and it's lossy in one specific way:
 CVAT rectangles are exported as 4-point `Polygon`s (a rectangle drawn at an angle isn't
@@ -37,7 +41,8 @@ from rest_framework.serializers import ValidationError
 
 from cvat.apps.dataset_manager.bindings import CommonData, JobData
 from cvat.apps.dataset_manager.formats.registry import exporter, importer
-from cvat.apps.engine.models import Job, JobType, ShapeType, StateChoice
+from cvat.apps.dataset_manager.formats.utils import get_label_color
+from cvat.apps.engine.models import Job, JobType, Label, LabelType, ShapeType, StateChoice
 from cvat.apps.geospatial.models import RasterTile
 from cvat.apps.geospatial.services import (
     pixel_pairs_to_wgs84,
@@ -294,6 +299,39 @@ def _clip_feature_to_tiles(geojson_type: str, raster_pixel_pairs: list[tuple[flo
                 yield tile, ShapeType.POINTS, _to_tile_local_flat_points(coords, tile)
 
 
+def _ensure_label_registered(instance_data: CommonData, label_name: str) -> None:
+    """Create a new top-level label the first time a GeoJSON feature names one that
+    doesn't already exist on the target task (or its project, if it belongs to one --
+    a project-owned task shares its project's label set, see
+    `InstanceLabelData.__init__`), instead of rejecting the whole import over an
+    unrecognized class name (see the module docstring).
+
+    Mutates `instance_data`'s internal `_label_mapping` cache directly so the new label
+    is immediately visible to `_get_label_id()`, without re-querying the database.
+    """
+    already_exists = any(
+        db_label.name == label_name and db_label.parent_id is None
+        for db_label in instance_data._label_mapping.values()
+    )
+    if already_exists:
+        return
+
+    db_task = instance_data._db_task
+    if db_task.project_id is not None:
+        parent_kwargs = {"project": db_task.project}
+    else:
+        parent_kwargs = {"task": db_task}
+
+    existing_colors = [db_label.color for db_label in instance_data._label_mapping.values() if db_label.color]
+    db_label = Label.create(
+        name=label_name,
+        type=LabelType.ANY,
+        color=get_label_color(label_name, existing_colors),
+        **parent_kwargs,
+    )
+    instance_data._label_mapping[db_label.id] = db_label
+
+
 @importer(name="GeoJSON", version="1.0", ext="GEOJSON")
 def _import(src_file, temp_dir, instance_data: CommonData, load_data_callback=None, **kwargs):
     if load_data_callback is not None:
@@ -312,6 +350,10 @@ def _import(src_file, temp_dir, instance_data: CommonData, load_data_callback=No
         if not label_name:
             raise ValidationError(f"A GeoJSON feature is missing a 'label' property: {feature}")
         occluded = bool(properties.get("occluded", False))
+
+        # Unlike most CVAT importers, an unrecognized class name doesn't fail the
+        # import -- it's registered as a new label on the fly (see docstring).
+        _ensure_label_registered(instance_data, label_name)
 
         # RFC 7946: input is always WGS84 lon/lat, regardless of any legacy `crs`
         # member the file might carry -- see the module docstring.
