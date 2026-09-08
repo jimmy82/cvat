@@ -212,6 +212,35 @@ could be imported.
   behavior, since it's a deliberate departure from every other CVAT importer's
   behavior and worth calling out explicitly for anyone reading the code later.
 
+## Phase 7 — Fixing a stale-label bug the previous phase's feature exposed
+
+Using the new auto-create-labels feature for real, the user hit:
+
+    rest_framework.exceptions.ValidationError: [ErrorDetail(string='label_id 17 is invalid', code='invalid')]
+
+- Root cause (found via a dedicated investigation, not guessed): this wasn't in our
+  app at all. `dataset_manager.task.JobAnnotation.__init__` snapshots the task's/
+  project's labels into `self.db_labels` from `self.db_job`'s already-*prefetched*
+  `label_set` **before the importer runs**, and validates every imported shape's label
+  against that snapshot **after** the importer finishes
+  (`_validate_label_for_existence`). A label our importer creates mid-import is
+  genuinely committed to the database by then, but `self.db_labels` was frozen before
+  that happened, so it looked "not registered."
+- Fixed in core `cvat/apps/dataset_manager/task.py` (not geospatial-specific, since any
+  importer that creates labels on the fly would hit the same bug): added
+  `JobAnnotation._reload_labels()`, called right after the importer returns and before
+  validation/save. It deliberately re-queries `models.Label.objects` directly rather
+  than through `db_segment.task.label_set`/`project.label_set` -- a **prefetched**
+  relation manager's `.all()` keeps serving the original snapshot forever regardless of
+  what's since been written to the database, so naively reusing `__init__`'s own
+  approach for the reload would silently not have fixed anything.
+- Task-level import (as opposed to job-level) doesn't need this fix: it builds a fresh
+  `JobAnnotation` per job only after the importer has already run, so it's never
+  working from a stale snapshot in the first place.
+- Verified by reproducing the exact failure against a real task and job (created a
+  label mid-flight the way the importer does, confirmed it was missing from
+  `db_labels` beforehand and present after `_reload_labels()`), then redeployed.
+
 ## Key files touched
 
 - `cvat/apps/geospatial/` — GeoTIFF ingestion/tiling, coordinate transforms, GeoJSON

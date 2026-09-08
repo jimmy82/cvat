@@ -229,14 +229,35 @@ class JobAnnotation:
         self.stop_frame = db_segment.stop_frame
         self.ir_data = AnnotationIR(db_segment.task.dimension)
 
-        self.db_labels = {
-            db_label.id: db_label
-            for db_label in (
-                db_segment.task.project.label_set.all()
-                if db_segment.task.project_id
-                else db_segment.task.label_set.all()
-            )
-        }
+        self._set_labels(
+            db_segment.task.project.label_set.all()
+            if db_segment.task.project_id
+            else db_segment.task.label_set.all()
+        )
+
+    def _reload_labels(self):
+        """Refresh `self.db_labels`/`self.db_attributes` from the database, bypassing
+        `self.db_job`'s prefetched `label_set`/`project.label_set` (see
+        `add_prefetch_info`) rather than reusing it as `__init__` does. Call this after
+        an importer has run: an importer can create new labels on the fly (see
+        `cvat.apps.geospatial.dataset_io._ensure_label_registered`), and a *prefetched*
+        relation manager's `.all()` keeps serving the snapshot taken when `self.db_job`
+        was first fetched forever, not a fresh query -- so reusing `__init__`'s
+        approach here would silently never see labels created after that point.
+        """
+        db_segment = self.db_job.segment
+        label_qs = db_utils.add_prefetch_fields(
+            models.Label.objects.all(), ["skeleton", "parent", "attributespec_set"]
+        )
+        label_qs = JobData.add_prefetch_info(label_qs)
+        if db_segment.task.project_id:
+            label_qs = label_qs.filter(project_id=db_segment.task.project_id)
+        else:
+            label_qs = label_qs.filter(task_id=db_segment.task.id)
+        self._set_labels(label_qs)
+
+    def _set_labels(self, db_labels_qs):
+        self.db_labels = {db_label.id: db_label for db_label in db_labels_qs}
 
         self.db_attributes = {}
         for db_label in self.db_labels.values():
@@ -1019,6 +1040,9 @@ class JobAnnotation:
 
                 raise not_found
 
+        # An importer can create new labels while it runs (see `_reload_labels`'s
+        # docstring); re-load before validating/saving the imported data against them.
+        self._reload_labels()
         self.create(job_data.data.slice(self.start_frame, self.stop_frame).serialize())
 
 

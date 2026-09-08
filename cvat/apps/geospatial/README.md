@@ -143,6 +143,22 @@ newly added label, apply going forward only -- they don't retroactively affect
 annotations already made under a different name for what a human would consider "the
 same" class.
 
+**This required a small core `cvat.apps.dataset_manager` fix**, not just a change in
+this app: for a *job*-level import, `JobAnnotation.__init__` (`dataset_manager/task.py`)
+snapshots the task's/project's labels into `self.db_labels` from `self.db_job`'s
+*prefetched* `label_set` before the importer ever runs, and validates every imported
+shape's label against that snapshot afterward
+(`_validate_label_for_existence`) -- so a label created mid-import (by us, or by any
+future importer that does the same thing) looked "not registered" even though it
+genuinely existed in the database by the time validation ran. Fixed by adding
+`JobAnnotation._reload_labels()`, called right after the importer returns and before
+validation, which re-queries `models.Label.objects` directly rather than through the
+prefetched relation (a prefetched manager's `.all()` keeps serving its original
+snapshot forever, so reusing `__init__`'s own approach here would not have worked).
+Task-level import doesn't need this fix -- it builds a fresh `JobAnnotation` per job
+only *after* the importer has already run. Verified live: reproduced the stale
+validation failure against a real task/job, confirmed `_reload_labels()` fixes it.
+
 Settable through `POST /api/tasks/{id}/data` (validated: `overlap` must be smaller than
 `tile_size`) and through the Create Task page's Advanced Configuration section in the
 UI ("Tile size" / "Tile overlap"). Setting `tile_size` at or above the raster's own
@@ -182,6 +198,10 @@ georeferencing model. In brief:
   `_ensure_label_registered` created a new `road` label on the task, was confirmed
   idempotent on a second call with the same name (no duplicate), and the test label was
   removed afterward.
+* `JobAnnotation._reload_labels()`: reproduced the exact failure a real user hit
+  (`label_id \`N\` is invalid` on job-level import right after a new label was
+  created) against a real task/job, confirmed the label was genuinely missing from
+  `db_labels` before the fix and present after `_reload_labels()` runs.
 
 ## Known gaps / follow-ups for a real deployment
 
