@@ -229,21 +229,31 @@ class JobAnnotation:
         self.stop_frame = db_segment.stop_frame
         self.ir_data = AnnotationIR(db_segment.task.dimension)
 
-        self._set_labels(
-            db_segment.task.project.label_set.all()
-            if db_segment.task.project_id
-            else db_segment.task.label_set.all()
-        )
+        # Deliberately *not* `db_segment.task.label_set.all()` /
+        # `project.label_set.all()` here -- see `_reload_labels`'s docstring for why
+        # that would be wrong whenever `db_job` was handed in already constructed
+        # (`put_job_data`/`patch_job_data`, used by `TaskAnnotation._patch_data` for a
+        # task-level import, pass in a `db_job` fetched *before* the importer ran).
+        self._reload_labels()
 
     def _reload_labels(self):
-        """Refresh `self.db_labels`/`self.db_attributes` from the database, bypassing
+        """(Re)build `self.db_labels`/`self.db_attributes` from the database, bypassing
         `self.db_job`'s prefetched `label_set`/`project.label_set` (see
-        `add_prefetch_info`) rather than reusing it as `__init__` does. Call this after
-        an importer has run: an importer can create new labels on the fly (see
-        `cvat.apps.geospatial.dataset_io._ensure_label_registered`), and a *prefetched*
-        relation manager's `.all()` keeps serving the snapshot taken when `self.db_job`
-        was first fetched forever, not a fresh query -- so reusing `__init__`'s
-        approach here would silently never see labels created after that point.
+        `add_prefetch_info`). Called from `__init__`, and again after an importer runs
+        in `import_annotations` below.
+
+        An importer can create new labels on the fly (see
+        `cvat.apps.geospatial.dataset_io._ensure_label_registered`), and this needs to
+        see them reliably regardless of *when* `self.db_job` itself was fetched
+        relative to that: a **prefetched** relation manager's `.all()` keeps serving
+        the snapshot taken when the prefetch query ran forever, not a fresh query, so
+        `db_segment.task.label_set.all()` would silently miss a label created after
+        that snapshot -- which happens not just for the "reload after our own import"
+        call below, but also whenever `self.db_job` was constructed and prefetched
+        *before* some earlier step already ran an importer (e.g. a task-level import:
+        `TaskAnnotation._patch_data` reuses one `db_job` per job, fetched once up front,
+        across every job's `JobAnnotation(..., db_job=db_job)` construction that
+        happens only after the importer has already run).
         """
         db_segment = self.db_job.segment
         label_qs = db_utils.add_prefetch_fields(

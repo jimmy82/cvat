@@ -144,20 +144,36 @@ annotations already made under a different name for what a human would consider 
 same" class.
 
 **This required a small core `cvat.apps.dataset_manager` fix**, not just a change in
-this app: for a *job*-level import, `JobAnnotation.__init__` (`dataset_manager/task.py`)
-snapshots the task's/project's labels into `self.db_labels` from `self.db_job`'s
-*prefetched* `label_set` before the importer ever runs, and validates every imported
-shape's label against that snapshot afterward
-(`_validate_label_for_existence`) -- so a label created mid-import (by us, or by any
-future importer that does the same thing) looked "not registered" even though it
-genuinely existed in the database by the time validation ran. Fixed by adding
-`JobAnnotation._reload_labels()`, called right after the importer returns and before
-validation, which re-queries `models.Label.objects` directly rather than through the
-prefetched relation (a prefetched manager's `.all()` keeps serving its original
-snapshot forever, so reusing `__init__`'s own approach here would not have worked).
-Task-level import doesn't need this fix -- it builds a fresh `JobAnnotation` per job
-only *after* the importer has already run. Verified live: reproduced the stale
-validation failure against a real task/job, confirmed `_reload_labels()` fixes it.
+this app, and took two attempts to get right. `JobAnnotation` (`dataset_manager/task.py`)
+validates every imported shape's `label_id` against `self.db_labels`
+(`_validate_label_for_existence`) -- a dict built from `self.db_job`'s *prefetched*
+`label_set`/`project.label_set` (see `add_prefetch_info`). A **prefetched** relation
+manager's `.all()` keeps serving the snapshot taken when the prefetch query ran,
+forever, regardless of what's since been written to the database -- so a label created
+mid-import (by us, or by any future importer that does the same thing) looked "not
+registered" even though it genuinely existed by validation time. This bites in two
+different spots, not just one:
+
+1. *Job*-level import: `JobAnnotation.__init__` snapshots labels *before*
+   `import_annotations` runs the importer. Fixed by re-loading right after the importer
+   returns and before validation/save.
+2. *Task*-level import (`TaskAnnotation._patch_data`, used by the ordinary "Upload
+   annotations" task-level endpoint): the importer runs first, but `_patch_data` then
+   reuses one `db_job` object *fetched before that* (once, up front, for the whole
+   task) for every job's `JobAnnotation(..., db_job=db_job)` construction --so even
+   though each `JobAnnotation` is a fresh object built *after* the importer ran, it's
+   built from an already-stale prefetched `db_job`. The first fix (reload only in
+   job-level `import_annotations`) missed this path entirely, and a real import through
+   it still failed the same way.
+
+Both are fixed by the same underlying change: `JobAnnotation`'s label loading always
+re-queries `models.Label.objects` directly (filtered by task/project id), never through
+`db_job`'s prefetched relation, regardless of whether it's the initial load in
+`__init__` or the explicit post-import reload in `import_annotations`. Verified against
+the real production entrypoint (`dm.task.import_task_annotations`, not just internal
+methods): imported a real GeoJSON file naming a brand-new class through the actual
+task-level path, confirmed the shape landed with the correct label and points, and
+confirmed (via the task's event log) the test left no other trace behind.
 
 Settable through `POST /api/tasks/{id}/data` (validated: `overlap` must be smaller than
 `tile_size`) and through the Create Task page's Advanced Configuration section in the
@@ -198,10 +214,14 @@ georeferencing model. In brief:
   `_ensure_label_registered` created a new `road` label on the task, was confirmed
   idempotent on a second call with the same name (no duplicate), and the test label was
   removed afterward.
-* `JobAnnotation._reload_labels()`: reproduced the exact failure a real user hit
-  (`label_id \`N\` is invalid` on job-level import right after a new label was
-  created) against a real task/job, confirmed the label was genuinely missing from
-  `db_labels` before the fix and present after `_reload_labels()` runs.
+* `JobAnnotation`'s stale-label-snapshot fix: reproduced the exact failure a real user
+  hit (`label_id \`N\` is invalid` right after a new label was created mid-import)
+  against a real task/job in isolation first, then -- after finding the first attempt
+  only covered the job-level path -- imported a real GeoJSON file naming a new class
+  through the actual `dm.task.import_task_annotations` production entrypoint
+  (task-level, the path that was still failing), confirmed the shape landed correctly,
+  and confirmed via the task's ClickHouse event log that the test added and removed
+  exactly one label and one shape, nothing else.
 
 ## Known gaps / follow-ups for a real deployment
 
