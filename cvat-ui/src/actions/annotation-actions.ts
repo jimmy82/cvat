@@ -136,6 +136,7 @@ export enum AnnotationActionTypes {
     UPLOAD_JOB_ANNOTATIONS = 'UPLOAD_JOB_ANNOTATIONS',
     UPLOAD_JOB_ANNOTATIONS_SUCCESS = 'UPLOAD_JOB_ANNOTATIONS_SUCCESS',
     UPLOAD_JOB_ANNOTATIONS_FAILED = 'UPLOAD_JOB_ANNOTATIONS_FAILED',
+    UPDATE_JOB_LABELS_SUCCESS = 'UPDATE_JOB_LABELS_SUCCESS',
     REMOVE_JOB_ANNOTATIONS_SUCCESS = 'REMOVE_JOB_ANNOTATIONS_SUCCESS',
     REMOVE_JOB_ANNOTATIONS_FAILED = 'REMOVE_JOB_ANNOTATIONS_FAILED',
     UPDATE_CANVAS_CONTEXT_MENU = 'UPDATE_CANVAS_CONTEXT_MENU',
@@ -391,6 +392,26 @@ export function fetchAnnotationsAsync(): ThunkAction {
                 payload: {
                     error,
                 },
+            });
+        }
+    };
+}
+
+// A job's `labels` are otherwise only ever set once, when the Job instance is
+// constructed (see cvat-core's `Job.reinit`) -- so a label created server-side after
+// that point (e.g. by a dataset import that auto-registers an unrecognized class, see
+// cvat.apps.geospatial.dataset_io._ensure_label_registered) never reaches the
+// annotation page's class selector until a full reload. Call this after an import
+// completes to pick such labels up without one.
+export function refreshJobLabelsAsync(jobInstance: NonNullable<CombinedState['annotation']['job']['instance']>): ThunkAction {
+    return async (dispatch: ThunkDispatch, getState: () => CombinedState): Promise<void> => {
+        const labels = await jobInstance.fetchLabels();
+
+        const relevantInstance = getState().annotation.job.instance;
+        if (relevantInstance && relevantInstance.id === jobInstance.id) {
+            dispatch({
+                type: AnnotationActionTypes.UPDATE_JOB_LABELS_SUCCESS,
+                payload: { labels },
             });
         }
     };

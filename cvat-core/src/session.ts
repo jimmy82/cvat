@@ -800,6 +800,10 @@ export class Job extends Session {
         return [...this.#data.labels];
     }
 
+    public set labels(labels: Label[]) {
+        this.#data.labels = [...labels];
+    }
+
     public get type(): JobType {
         return this.#data.type;
     }
@@ -857,6 +861,19 @@ export class Job extends Session {
 
     async mergeConsensusJobs(): Promise<string> {
         const result = await PluginRegistry.apiWrapper.call(this, Job.prototype.mergeConsensusJobs);
+        return result;
+    }
+
+    // Re-fetches this job's labels from the server and replaces `this.labels` with the
+    // result. Needed because an annotation import can create a new label on the fly
+    // (e.g. a GeoJSON import naming a class that doesn't exist yet -- see
+    // cvat.apps.geospatial.dataset_io._ensure_label_registered), entirely server-side,
+    // with no other frontend action to pick it up: `labels` is otherwise only set once,
+    // when this Job instance is constructed (see `reinit`'s own comment on why it
+    // doesn't touch labels), so the annotation page's class selector would keep
+    // showing whatever existed at page-load time until a full reload.
+    async fetchLabels(): Promise<Label[]> {
+        const result = await PluginRegistry.apiWrapper.call(this, Job.prototype.fetchLabels);
         return result;
     }
 }

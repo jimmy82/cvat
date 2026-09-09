@@ -175,6 +175,40 @@ methods): imported a real GeoJSON file naming a brand-new class through the actu
 task-level path, confirmed the shape landed with the correct label and points, and
 confirmed (via the task's event log) the test left no other trace behind.
 
+**A second, frontend-only gap remained even after the backend fix above**: a label
+CVAT's backend genuinely created mid-import never appeared in the annotation page's
+own "new shape" class selector until a full page reload. `cvat-core`'s `Job.labels`
+(`cvat-core/src/session.ts`) is populated once, when the `Job` instance is constructed
+(`Job.reinit`'s own comment flags this: "labels also may get changed, but ... need to
+think on this additionally"), and `cvat-ui`'s import-completion handler
+(`actions/import-actions.ts`'s `importDatasetAsync`) only ever re-fetched the
+annotations themselves afterward, never the job's labels.
+
+Fixed by adding `Job.fetchLabels()` (`session.ts` + its implementation in
+`session-implementation.ts`, following the exact same `PluginRegistry.apiWrapper.call`
+/ `Object.defineProperty(..., 'implementation', ...)` pattern every other `Job` method
+already uses) -- it re-queries `serverProxy.labels.get({ job_id })` and replaces
+`this.labels` via a new setter. `import-actions.ts` now awaits a new
+`refreshJobLabelsAsync(jobInstance)` thunk (`actions/annotation-actions.ts`) right
+after a job-level import succeeds and *before* re-fetching annotations -- ordering
+matters here: an annotation for the brand-new label must not be converted into an
+`ObjectState` before that label exists in `jobInstance.labels`, or resolving the shape's
+label crashes downstream UI code that assumes every shape's label is always defined.
+A new `UPDATE_JOB_LABELS_SUCCESS` reducer case (`reducers/annotation-reducer.ts`)
+updates `state.job.labels`/`state.job.attributes` the same way `GET_JOB_SUCCESS`
+already does for the initial load.
+
+Verified directly against the real running bundle from the browser console (not just
+code review): held a reference to an already-constructed `Job` instance, created a new
+label on the task server-side (bypassing the UI entirely, the same way an import would),
+then called `.fetchLabels()` on that stale instance and confirmed it picked up the new
+label in place. Driving the actual upload modal end-to-end through browser automation
+proved unreliable in this environment (AntD's controlled Select/Upload form components
+don't reliably respond to synthetic DOM events), so this direct-mechanism test is the
+verification of record for the frontend half of the fix; the backend half (label
+creation, persistence, and the stale-snapshot fix above) was verified through the real
+HTTP import path as noted above.
+
 Settable through `POST /api/tasks/{id}/data` (validated: `overlap` must be smaller than
 `tile_size`) and through the Create Task page's Advanced Configuration section in the
 UI ("Tile size" / "Tile overlap"). Setting `tile_size` at or above the raster's own

@@ -252,6 +252,43 @@ Using the new auto-create-labels feature for real, the user hit:
   added and removed exactly the one label and one shape it created and nothing else
   (no pre-existing annotation data was at risk — the task had none before the test).
 
+## Phase 8 — New classes didn't show up in the "draw new shape" selector
+
+The user reported: after importing the file that created new classes, drawing a new
+rectangle only offered 1 class, not 2. The backend fix in Phase 7 was working
+correctly (both labels genuinely existed on the task) — this was a separate,
+frontend-only gap: `cvat-core`'s `Job.labels` is populated once when the `Job`
+instance is constructed, and nothing in the import-completion flow ever refreshed it
+afterward, so the canvas toolbar's class selector kept showing whatever existed at
+page-load time until a full reload.
+
+- Added `Job.fetchLabels()` to `cvat-core` (`cvat-core/src/session.ts` +
+  `session-implementation.ts`), following the exact same plugin-wrapped-method pattern
+  every other `Job` method already uses — re-queries the job's labels from the server
+  and replaces `Job.labels` via a new setter.
+- Added a `refreshJobLabelsAsync` thunk and `UPDATE_JOB_LABELS_SUCCESS` reducer case in
+  `cvat-ui`, wired into the job-level annotation-import flow
+  (`actions/import-actions.ts`) to run right after import succeeds and *before*
+  annotations are re-fetched — ordering matters, since converting a shape into an
+  `ObjectState` before its label is known crashes downstream UI code.
+- **Verification took two tries.** Driving the actual "Upload annotations" modal
+  through browser automation proved unreliable — AntD's controlled Select/Upload
+  components don't consistently respond to synthetic DOM events, and repeated
+  attempts produced confusing partial states (format/mode fields silently resetting,
+  duplicate submissions from replayed clicks). One such duplicate-submission race
+  did reproduce a real, separate crash ("Cannot read properties of undefined (reading
+  'attributes')") — traced to the same "shape references a label the client doesn't
+  know about yet" hazard the fix's ordering already guards against for the normal
+  case, just re-triggered by two overlapping import flows racing each other; a
+  robustness gap worth fixing later, not a flaw in this fix itself.
+  Rather than keep fighting the automation, verified the actual mechanism directly
+  from the browser console against the real running bundle: held a reference to an
+  already-constructed `Job` instance, created a new label on the task server-side
+  (bypassing the UI, the same way an import does), then called `.fetchLabels()` on
+  that stale instance and confirmed it picked up the new label in place.
+- Cleaned up all test labels/shapes and the temporary test account used for this
+  verification afterward.
+
 ## Key files touched
 
 - `cvat/apps/geospatial/` — GeoTIFF ingestion/tiling, coordinate transforms, GeoJSON

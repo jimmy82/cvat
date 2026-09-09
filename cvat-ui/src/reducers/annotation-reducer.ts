@@ -941,6 +941,22 @@ export default (state = defaultState, action: AnyAction): AnnotationState => {
                 },
             };
         }
+        case AnnotationActionTypes.UPDATE_JOB_LABELS_SUCCESS: {
+            const { labels } = action.payload;
+
+            return {
+                ...state,
+                job: {
+                    ...state.job,
+                    labels,
+                    attributes: labels
+                        .reduce((acc: Record<number, Label['attributes']>, label: Label) => {
+                            acc[label.id!] = label.attributes;
+                            return acc;
+                        }, {}),
+                },
+            };
+        }
         case AnnotationActionTypes.REMOVE_JOB_ANNOTATIONS_SUCCESS: {
             return {
                 ...state,

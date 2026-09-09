@@ -30,7 +30,7 @@ import Issue from './issue';
 import {
     SerializedTask, SerializedJobValidationLayout, SerializedTaskValidationLayout,
 } from './server-response-types';
-import { getUpdatedLabels } from './labels';
+import { Label, getUpdatedLabels } from './labels';
 import { checkInEnum, checkObjectType } from './common';
 import {
     getCollection, getSaver, clearAnnotations, getAnnotations,
@@ -179,6 +179,19 @@ export function implementJob(Job: typeof JobClass): typeof JobClass {
             }
 
             return null;
+        },
+    });
+
+    Object.defineProperty(Job.prototype.fetchLabels, 'implementation', {
+        value: async function fetchLabelsImplementation(
+            this: JobClass,
+        ): ReturnType<typeof JobClass.prototype.fetchLabels> {
+            const labelsData = await serverProxy.labels.get({ job_id: this.id });
+            const labels = labelsData.results
+                .map((labelData) => new Label(labelData))
+                .filter((label) => !label.hasParent);
+            this.labels = labels;
+            return labels;
         },
     });
 

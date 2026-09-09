@@ -8,7 +8,7 @@ import {
     getCore, Storage, Job, Task, Project, ProjectOrTaskOrJob,
 } from 'cvat-core-wrapper';
 import { getProjectsAsync } from './projects-actions';
-import { AnnotationActionTypes, fetchAnnotationsAsync } from './annotation-actions';
+import { AnnotationActionTypes, fetchAnnotationsAsync, refreshJobLabelsAsync } from './annotation-actions';
 import {
     listen, RequestInstanceType,
     RequestsActions, updateRequestProgress,
@@ -139,6 +139,10 @@ export const importDatasetAsync = (
 
                 const relevantInstance = getState().annotation.job.instance;
                 if (relevantInstance && relevantInstance.id === instance.id) {
+                    // an import can create a new label on the fly (e.g. a GeoJSON
+                    // import naming a class that doesn't exist yet), which otherwise
+                    // wouldn't show up in the class selector until a full page reload
+                    await dispatch(refreshJobLabelsAsync(instance as Job));
                     setTimeout(() => {
                         dispatch(fetchAnnotationsAsync());
                     });
