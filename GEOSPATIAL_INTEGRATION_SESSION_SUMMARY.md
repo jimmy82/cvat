@@ -289,6 +289,30 @@ page-load time until a full reload.
 - Cleaned up all test labels/shapes and the temporary test account used for this
   verification afterward.
 
+## Phase 9 — Rectangle tool's class selector didn't get the live update
+
+The user reported: "the selection in draw a rectangle does not have 2 classes but
+draw a polygon has 2 classes" — an inconsistency between two tools reading the exact
+same Redux state that Phase 8's fix had just started updating live.
+
+- Root cause: a genuine, pre-existing bug in core CVAT, not this app.
+  `DrawShapePopoverContainer` is mounted once per shape-type button (rectangle,
+  polygon, etc. each get their own instance, kept alive by antd's `Popover` once
+  opened) and computed its filtered label list *only in the constructor* — a popover
+  opened for the first time after the label refresh saw the update (fresh constructor
+  run); one already opened before the refresh never revisited it (no
+  `componentDidUpdate` existed at all). This bug could never have mattered before,
+  since nothing previously changed `state.annotation.job.labels` mid-session.
+- Fixed by adding a `componentDidUpdate` that recomputes the filtered label list (and
+  falls back the selected label if it's no longer valid) whenever `props.labels`
+  changes, extracting the filter logic the constructor already had into a shared
+  helper.
+- Verified directly: opened the rectangle popover with 1 label already mounted,
+  created a new label server-side and dispatched the exact same Redux action our
+  fix uses, and confirmed the already-open popover updated live to 2 classes without
+  being closed and reopened — precisely reproducing, then resolving, what the user
+  described.
+
 ## Key files touched
 
 - `cvat/apps/geospatial/` — GeoTIFF ingestion/tiling, coordinate transforms, GeoJSON

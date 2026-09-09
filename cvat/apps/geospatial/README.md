@@ -209,6 +209,33 @@ verification of record for the frontend half of the fix; the backend half (label
 creation, persistence, and the stale-snapshot fix above) was verified through the real
 HTTP import path as noted above.
 
+**A third gap, pre-existing in core CVAT and unrelated to this app, surfaced once the
+fix above started actually changing `state.annotation.job.labels` during a session**:
+a real user reported that after importing, the "draw new polygon" tool's class
+selector correctly showed the new class, but "draw new rectangle" still didn't --
+inconsistent behavior between two tools reading the exact same Redux state.
+`DrawShapePopoverContainer` (`cvat-ui/src/containers/annotation-page/standard-workspace
+/controls-side-bar/draw-shape-popover.tsx`) is mounted once per shape-type button (a
+separate instance for rectangle, polygon, polyline, etc., each wrapped in its own antd
+`Popover` that mounts its content on first open and never unmounts it again), and its
+label list (`this.satisfiedLabels`, filtered from `props.labels` by shape type) was
+computed **only in the constructor** -- correct for whichever instance hadn't been
+opened yet before the label refresh (fresh constructor run, sees the update), stale
+forever for whichever had already been opened before it (no `componentDidUpdate`/
+`getDerivedStateFromProps` ever revisited it). This bug existed before our work here
+too; nothing about `state.annotation.job.labels` ever changing mid-session, for any
+reason, was needed to trigger it -- it just never had a code path capable of triggering
+it until this app added one.
+
+Fixed by recomputing `satisfiedLabels` (and the selected label, falling back to the
+first satisfied label if the previous selection is no longer valid) in a
+`componentDidUpdate` that compares `prevProps.labels` against the current value, using
+a small extracted `computeSatisfiedLabels()` helper shared with the constructor.
+Verified directly: opened the rectangle popover with 1 label already mounted, created
+a new label server-side and dispatched the same `UPDATE_JOB_LABELS_SUCCESS` action
+`refreshJobLabelsAsync` dispatches, and confirmed the already-open popover's dropdown
+updated to show both classes without being closed and reopened.
+
 Settable through `POST /api/tasks/{id}/data` (validated: `overlap` must be smaller than
 `tile_size`) and through the Create Task page's Advanced Configuration section in the
 UI ("Tile size" / "Tile overlap"). Setting `tile_size` at or above the raster's own

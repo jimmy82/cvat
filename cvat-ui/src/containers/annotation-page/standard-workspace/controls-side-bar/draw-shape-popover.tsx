@@ -105,13 +105,7 @@ class DrawShapePopoverContainer extends React.PureComponent<Props, State> {
 
         const { shapeType } = props;
         this.isPolyShape = [ShapeType.POLYGON, ShapeType.POLYLINE].includes(shapeType);
-        this.satisfiedLabels = props.labels.filter((label: Label) => {
-            if (shapeType === ShapeType.SKELETON) {
-                return label.type === LabelType.SKELETON;
-            }
-
-            return ['any', shapeType].includes(label.type as string);
-        });
+        this.satisfiedLabels = this.computeSatisfiedLabels(props.labels);
 
         const defaultLabelID = this.satisfiedLabels.length ? this.satisfiedLabels[0].id as number : null;
         const defaultRectDrawingMethod = RectDrawingMethod.CLASSIC;
@@ -130,6 +124,41 @@ class DrawShapePopoverContainer extends React.PureComponent<Props, State> {
         } else if (shapeType === ShapeType.POINTS) {
             this.minimumPoints = 1;
         }
+    }
+
+    public componentDidUpdate(prevProps: Props): void {
+        const { labels } = this.props;
+        if (prevProps.labels !== labels) {
+            // `labels` can change after this popover has already mounted -- e.g. an
+            // annotation import registering a new class on the fly (see
+            // cvat.apps.geospatial.dataset_io._ensure_label_registered) -- and unlike
+            // `satisfiedLabels`, which used to be computed once in the constructor and
+            // never revisited, this needs to stay in sync for as long as the popover
+            // (mounted once per shape-type button, then kept alive by antd's Popover)
+            // stays open across multiple draws in the same session.
+            this.satisfiedLabels = this.computeSatisfiedLabels(labels);
+            this.setState((prevState) => {
+                const stillValid = this.satisfiedLabels.some((label) => label.id === prevState.selectedLabelID);
+                if (stillValid) {
+                    return null;
+                }
+
+                return {
+                    selectedLabelID: this.satisfiedLabels.length ? this.satisfiedLabels[0].id as number : null,
+                };
+            });
+        }
+    }
+
+    private computeSatisfiedLabels(labels: Label[]): Label[] {
+        const { shapeType } = this.props;
+        return labels.filter((label: Label) => {
+            if (shapeType === ShapeType.SKELETON) {
+                return label.type === LabelType.SKELETON;
+            }
+
+            return ['any', shapeType].includes(label.type as string);
+        });
     }
 
     private onDraw(objectType: ObjectType): void {
