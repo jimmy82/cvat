@@ -236,6 +236,24 @@ a new label server-side and dispatched the same `UPDATE_JOB_LABELS_SUCCESS` acti
 `refreshJobLabelsAsync` dispatches, and confirmed the already-open popover's dropdown
 updated to show both classes without being closed and reopened.
 
+**A fourth gap surfaced once the fix above was exercised through the real upload
+modal end-to-end** (rather than the synthetic Redux dispatch used to verify it, which
+happened not to trigger this): `importDatasetAsync`'s job branch called
+`refreshJobLabelsAsync` *after* `(instance as Job).annotations.clear({ reload: true
+})`. That call rebuilds cvat-core's internal annotation collection straight from the
+server's response using whatever label list the job instance had *at that moment* --
+if the import had just created a new label and a shape uses it, the label wasn't
+loaded yet, and building that shape's `ObjectState` threw (`Cannot read properties of
+undefined (reading 'attributes')` in `AnnotationBase.appendDefaultAttributes`, since
+`this.labels[label_id]` came up empty) instead of just not showing the label yet.
+Fixed by moving the `refreshJobLabelsAsync` call to run *before*
+`annotations.clear({ reload: true })`, so the label list is already current by the
+time that rebuild happens. Verified against the real upload modal end-to-end (format
+selection, file attachment, and submission all driven programmatically against the
+real DOM, not simulated): reproduced the crash against the unfixed build, confirmed
+it's gone against the fixed one, and confirmed the already-open rectangle popover
+picks up each newly imported class live, repeated across four consecutive imports.
+
 Settable through `POST /api/tasks/{id}/data` (validated: `overlap` must be smaller than
 `tile_size`) and through the Create Task page's Advanced Configuration section in the
 UI ("Tile size" / "Tile overlap"). Setting `tile_size` at or above the raster's own

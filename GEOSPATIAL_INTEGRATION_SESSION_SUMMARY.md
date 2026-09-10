@@ -313,6 +313,37 @@ same Redux state that Phase 8's fix had just started updating live.
   being closed and reopened — precisely reproducing, then resolving, what the user
   described.
 
+## Phase 10 — A real end-to-end test found one more ordering bug, then a deploy that silently failed
+
+The user reported the rectangle popover was still stuck at 1 class even after Phase 9.
+Driving the real upload modal end-to-end (not the synthetic Redux dispatch used to
+verify Phase 9) reproduced a genuine crash: **"Could not upload annotation for the
+task #4 — Cannot read properties of undefined (reading 'attributes')."**
+
+- Root cause: `importDatasetAsync`'s job branch called `refreshJobLabelsAsync` *after*
+  `annotations.clear({ reload: true })`, which rebuilds cvat-core's annotation
+  collection from the server's response using the job's label list *at that moment* --
+  too late if the import just created the label a shape needs. Fixed by moving the
+  label refresh to run first.
+- **A background rebuild+redeploy of this fix reported "completed" but had actually
+  failed** (`yarn install --immutable` hit a network timeout inside the Docker build,
+  exit code 1) -- the task notification's success framing didn't reflect the real
+  build outcome. Caught by directly checking the built image's build timestamp and
+  grepping the served JS bundle for the fix, rather than trusting the notification.
+  Retried the build, which succeeded on the second attempt, and confirmed the new
+  bundle was actually being served before re-testing.
+- Verified with a fully end-to-end test through the real UI: opened the rectangle
+  popover first (mounting it with N labels), then drove the actual upload modal
+  (format selection, file attachment, submission, and the "replace annotations?"
+  confirmation) programmatically against the real DOM -- not a shortcut around the
+  UI -- across four consecutive imports, each adding one new class, confirming no
+  crash and that the already-open popover picked up every new class live each time.
+- Take-away for this session's own process: a task-completion notification reports
+  that a command finished, not that it succeeded -- always check the actual exit
+  status/output of what ran, especially for a multi-stage operation like a Docker
+  build where an early stage can fail while the overall shell wrapper still reports
+  "done."
+
 ## Key files touched
 
 - `cvat/apps/geospatial/` — GeoTIFF ingestion/tiling, coordinate transforms, GeoJSON
