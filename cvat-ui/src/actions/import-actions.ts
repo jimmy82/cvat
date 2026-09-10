@@ -129,6 +129,23 @@ export const importDatasetAsync = (
                 );
 
                 await listenForImport(rqID);
+
+                const relevantInstance = getState().annotation.job.instance;
+                if (relevantInstance && relevantInstance.id === instance.id) {
+                    // Refresh labels *before* reloading annotations from the server: an
+                    // import can create a new label on the fly (e.g. a GeoJSON import
+                    // naming a class that doesn't exist yet), and
+                    // `annotations.clear({ reload: true })` below immediately rebuilds
+                    // cvat-core's internal annotation collection from the server's fresh
+                    // data using this job's *current* label list -- if that still doesn't
+                    // include the new label, building the imported shape that uses it
+                    // throws (`Cannot read properties of undefined (reading
+                    // 'attributes')` in `AnnotationBase.appendDefaultAttributes`, since
+                    // `this.labels[label_id]` comes up empty) instead of just not
+                    // showing the label in the UI yet.
+                    await dispatch(refreshJobLabelsAsync(instance as Job));
+                }
+
                 await (instance as Job).annotations.clear({ reload: true });
                 await (instance as Job).actions.clear();
 
@@ -137,12 +154,7 @@ export const importDatasetAsync = (
                 // clientID has different type (polygon, rectangle) for example
                 dispatch({ type: AnnotationActionTypes.UPLOAD_JOB_ANNOTATIONS_SUCCESS });
 
-                const relevantInstance = getState().annotation.job.instance;
                 if (relevantInstance && relevantInstance.id === instance.id) {
-                    // an import can create a new label on the fly (e.g. a GeoJSON
-                    // import naming a class that doesn't exist yet), which otherwise
-                    // wouldn't show up in the class selector until a full page reload
-                    await dispatch(refreshJobLabelsAsync(instance as Job));
                     setTimeout(() => {
                         dispatch(fetchAnnotationsAsync());
                     });
