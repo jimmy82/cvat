@@ -118,6 +118,26 @@ export const importDatasetAsync = (
                     { convMaskToPoly, importMode },
                 );
                 await listenForImport(rqID);
+
+                // A task-level import replaces every job's annotations in the task. If
+                // this same browser tab already has one of that task's jobs open in the
+                // annotation page (e.g. opened earlier, then navigated to the task's own
+                // page to upload without a full reload), that job's Redux state is a
+                // stale snapshot from before the import and needs the same refresh the
+                // job-level import branch below does -- otherwise its label list and
+                // displayed shapes silently stay stale until the page is reloaded. This
+                // can't help a *different* tab/window with that job open, which has its
+                // own separate Redux store this code has no way to reach.
+                const relevantJobInstance = getState().annotation.job.instance;
+                if (relevantJobInstance && relevantJobInstance.taskId === instance.id) {
+                    await dispatch(refreshJobLabelsAsync(relevantJobInstance));
+                    await relevantJobInstance.annotations.clear({ reload: true });
+                    await relevantJobInstance.actions.clear();
+                    dispatch({ type: AnnotationActionTypes.UPLOAD_JOB_ANNOTATIONS_SUCCESS });
+                    setTimeout(() => {
+                        dispatch(fetchAnnotationsAsync());
+                    });
+                }
             } else { // job
                 dispatch(importActions.importDataset(instance, format));
                 const rqID = await (instance as Job).annotations.upload(
