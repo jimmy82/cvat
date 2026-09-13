@@ -344,6 +344,34 @@ task #4 — Cannot read properties of undefined (reading 'attributes')."**
   build where an early stage can fail while the overall shell wrapper still reports
   "done."
 
+## Phase 11 — "Rectangle only offers one class, polygon offers two" — not a bug this time
+
+The user reported a symptom that looks, on the surface, identical to the Phase 8-10
+stale-label-list bug already fixed on this branch: drawing a rectangle only offered
+`patrol boat`, while drawing a polygon on the same job offered both `vessel` and
+`patrol boat`.
+
+- Read `DrawShapePopoverContainer.computeSatisfiedLabels()`
+  (`cvat-ui/src/containers/annotation-page/standard-workspace/controls-side-bar/draw-shape-popover.tsx`)
+  rather than re-guessing: it filters the job's label list per shape-type button,
+  keeping only labels whose `type` is `'any'` or matches that exact `ShapeType`. This is
+  CVAT core's existing per-label shape-type scoping (`LabelType`:
+  `any`/`rectangle`/`polygon`/`polyline`/.../`skeleton`/`tag`) — a different mechanism
+  from Phase 8-10, which was about a label never appearing under *any* shape-type button
+  until a full reload, not about a label legitimately scoped to specific ones.
+- The Phase 9 `componentDidUpdate` fix (live-refreshing `satisfiedLabels` when
+  `props.labels` changes) is confirmed still present and correct in the current source —
+  so this isn't a regression of that fix either. If `vessel`'s label `type` is set to
+  `polygon`, no amount of live-refreshing would ever surface it under the rectangle
+  button, because it's filtered out by design, not by staleness.
+- Did **not** query the user's live label config directly (no DB/API access to their
+  running instance from this session), so the exact `type` value on `vessel` is inferred
+  from the reported symptom plus the code path above, not confirmed against the
+  database. Told the user plainly that this reads as expected, by-design behavior rather
+  than a defect: if `vessel` should also be drawable as a rectangle, its label `type`
+  needs changing to `any` (or `rectangle`) via the task/project Labels editor — a
+  data/config change on their instance, not a code fix.
+
 ## Key files touched
 
 - `cvat/apps/geospatial/` — GeoTIFF ingestion/tiling, coordinate transforms, GeoJSON
